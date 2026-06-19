@@ -1,0 +1,21 @@
+[project]
+name = "perishable-offers"
+version = "0.1.0"
+description = "J24 Same-Day Perishables Clearance — Temporal markdown agent"
+requires-python = ">=3.10"
+dependencies = [
+    "temporalio>=1.8.0",
+    "pydantic>=2.0",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "sqlalchemy>=2.0",
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+pythonpath = ["."]

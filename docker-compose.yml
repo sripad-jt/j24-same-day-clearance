@@ -1,0 +1,91 @@
+services:
+  # --- Postgres: app read-model + Temporal's own databases -----------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: perishable
+      POSTGRES_PASSWORD: perishable
+      POSTGRES_DB: perishable
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U perishable"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # --- Temporal dev cluster (auto-setup creates its schemas on postgres) ----
+  temporal:
+    image: temporalio/auto-setup:1.25.2
+    environment:
+      DB: postgres12
+      DB_PORT: 5432
+      POSTGRES_USER: perishable
+      POSTGRES_PWD: perishable
+      POSTGRES_SEEDS: postgres
+    ports:
+      - "7233:7233"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  temporal-ui:
+    image: temporalio/ui:2.34.0
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_CORS_ORIGINS: http://localhost:8081
+    ports:
+      - "8081:8080"
+    depends_on:
+      - temporal
+    restart: unless-stopped
+
+  # --- Our worker + control-plane API (shared image) ------------------------
+  worker:
+    build: .
+    image: perishable-offers:latest
+    environment:
+      DATABASE_URL: postgresql+psycopg://perishable:perishable@postgres:5432/perishable
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: perishables-tq
+    command: ["python", "worker.py"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  api:
+    build: .
+    image: perishable-offers:latest
+    environment:
+      DATABASE_URL: postgresql+psycopg://perishable:perishable@postgres:5432/perishable
+      TEMPORAL_ADDRESS: temporal:7233
+      TEMPORAL_NAMESPACE: default
+      TEMPORAL_TASK_QUEUE: perishables-tq
+    command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      temporal:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    image: perishable-offers-web:latest
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+    restart: unless-stopped
+
+volumes:
+  pgdata:
