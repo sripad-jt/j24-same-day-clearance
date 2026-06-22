@@ -5,6 +5,9 @@ The workflow stays a pure orchestrator and calls these by name.
 """
 from __future__ import annotations
 
+import os
+import time
+
 from temporalio import activity
 
 from adapters import catalog, copy_llm, goldeneye, inventory, notify, retailmedia
@@ -17,9 +20,23 @@ from shared.models import (
     RunPlan,
     SellThrough,
 )
+from shared.stores import get_store
 
 # Nominal start-of-day / close used to lay out the ladder (IST hours).
 T0_HOUR_IST = 8
+
+
+def _sellthrough_window_h() -> float:
+    """Hours of OUTWARDED history to count as the live sell-through window."""
+    try:
+        return float(os.getenv("INVENTORY_SELLTHROUGH_WINDOW_H", "24"))
+    except ValueError:
+        return 24.0
+
+
+def _since_ms(window_h: float) -> int:
+    """Epoch-ms cutoff `window_h` hours ago (real clock — only called in activities)."""
+    return int((time.time() - window_h * 3600) * 1000)
 
 
 @activity.defn
@@ -49,13 +66,20 @@ async def plan_run(
             eligible=False, skip_reason="JPIN not in catalogue",
         )
 
-    # Synthetic opening stock keyed off the JPIN so it's stable across replays.
+    # Opening stock (Q0) is synthetic, JPIN-keyed (stable across replays). There is
+    # no trustworthy live Q0 from the Inventory API: active `leftQty` is a stale
+    # 3-year lot pile (doesn't reflect sales), and OUTWARDED gives movements, not an
+    # opening batch. Real sell-through (units sold) IS read live per checkpoint in
+    # fetch_sellthrough via the OUTWARDED count. Price stays the catalogue
+    # placeholder — the API's listingSellingPrice is ₹1 (unusable anchor).
     q0 = 30 + (sum(ord(c) for c in jpin) % 25)  # 30..54
+    list_price = sku.list_price
+
     receipt = ReceiptContext(
         store_id=store_id, jpin=jpin, receipt_date=receipt_date,
         product_title=sku.product_title, category=sku.category, is_rte=sku.is_rte,
         shelf_life_days=sku.shelf_life_days, q0=q0,
-        list_price=sku.list_price, mrp=sku.mrp,
+        list_price=list_price, mrp=sku.mrp,
         received_epoch_ms=0, expiry_date=receipt_date,
     )
 
@@ -99,13 +123,37 @@ async def plan_run(
 
 @activity.defn
 async def fetch_sellthrough(
-    jpin: str, q0: int, nominal_elapsed_h: float, total_h: float,
+    store_id: str, jpin: str, q0: int, nominal_elapsed_h: float, total_h: float,
     trailing_window_h: float, markdown_pct: float,
 ) -> SellThrough:
+    # LIVE: real units sold over the window from the OUTWARDED count (sales = outward
+    # movements; active leftQty doesn't decrement). Best-effort — the OUTWARDED scan
+    # times out for high-volume sellers, so fall back to the synthetic curve with a
+    # low_confidence flag when it does.
+    if inventory.live_enabled():
+        facility_id = (get_store(store_id) or {}).get("facility_id")
+        if facility_id:
+            window_h = _sellthrough_window_h()
+            sold = await inventory.live_units_sold(
+                jpin, facility_id, _since_ms(window_h)
+            )
+            if sold is not None:
+                rate = sold / max(nominal_elapsed_h, 0.5)  # units / nominal hour
+                activity.logger.info(
+                    "live sell-through %s @ %s: sold=%s/%gh", jpin, facility_id,
+                    sold, window_h,
+                )
+                return SellThrough(units_sold=sold, run_rate=rate, low_confidence=False)
+            activity.logger.warning(
+                "live sell-through %s timed out — synthetic fallback", jpin
+            )
+
     sold, rate = inventory.sell_through(
         jpin, q0, nominal_elapsed_h, total_h, trailing_window_h, markdown_pct
     )
-    return SellThrough(units_sold=sold, run_rate=rate, low_confidence=False)
+    return SellThrough(
+        units_sold=sold, run_rate=rate, low_confidence=inventory.live_enabled()
+    )
 
 
 @activity.defn

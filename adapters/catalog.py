@@ -20,15 +20,24 @@ class CandidateSku:
     mrp: float
 
 
-# A deterministic catalogue for the demo. Leafy greens are L=1 (must clear today);
-# the RTE line exercises the auto-clear-to-₹1 path past the close gate.
+# Pilot leafy-green catalogue — the real J24 JPINs carried across the Essentials
+# stores (product-level, so the same set is offered for any selected store; the
+# store only changes the facility for downstream inventory/sell-through reads).
+# All are leafy greens, master shelf-life L=1 (must clear today).
+#
+# NOTE: list_price / mrp here are PLACEHOLDERS. The live value comes from the
+# Inventory Item Details API (`listingSellingPrice`) / Lot Management master —
+# wire that in `adapters/inventory.py` to replace these.
 _CATALOG: list[CandidateSku] = [
-    CandidateSku("JPIN-PALAK-001", "Fresh Palak (Spinach) 250g", "FNV_LEAFY", False, 1, 39.0, 49.0),
-    CandidateSku("JPIN-METHI-002", "Fresh Methi (Fenugreek) 200g", "FNV_LEAFY", False, 1, 29.0, 35.0),
-    CandidateSku("JPIN-CORIA-003", "Coriander Bunch 100g", "FNV_LEAFY", False, 1, 19.0, 25.0),
-    CandidateSku("JPIN-LETTU-004", "Iceberg Lettuce 300g", "FNV_LEAFY", False, 1, 59.0, 75.0),
-    CandidateSku("JPIN-SAMOS-101", "Hot Samosa (pack of 4)", "RTE", True, 1, 60.0, 60.0),
-    CandidateSku("JPIN-SANDW-102", "Veg Sandwich", "RTE", True, 1, 45.0, 45.0),
+    CandidateSku("JPIN-1304597126", "Coriander Leaves Bunch", "FNV_LEAFY", False, 1, 15.0, 20.0),
+    CandidateSku("JPIN-1304597236", "Curry Leaves", "FNV_LEAFY", False, 1, 12.0, 15.0),
+    CandidateSku("JPIN-1304597122", "Mint / Pudina Leaves", "FNV_LEAFY", False, 1, 15.0, 20.0),
+    CandidateSku("JPIN-1304597163", "Spinach Leaves", "FNV_LEAFY", False, 1, 25.0, 30.0),
+    CandidateSku("JPIN-1304597127", "Methi Leaves", "FNV_LEAFY", False, 1, 29.0, 35.0),
+    CandidateSku("JPIN-1304521194", "Dill Leaves", "FNV_LEAFY", False, 1, 20.0, 25.0),
+    CandidateSku("JPIN-1304562941", "Amaranthus Red Bunch", "FNV_LEAFY", False, 1, 18.0, 22.0),
+    CandidateSku("JPIN-1304565447", "Amaranthus Green Bunch", "FNV_LEAFY", False, 1, 18.0, 22.0),
+    CandidateSku("JPIN-1304193294", "Neem Leaves 1 Bunch, 1Pc", "FNV_LEAFY", False, 1, 10.0, 12.0),
 ]
 
 

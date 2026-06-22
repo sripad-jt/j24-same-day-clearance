@@ -230,10 +230,15 @@ class ManualOverride(BaseModel):
 
 
 class SeedRequest(BaseModel):
-    """API helper to start synthetic demo runs."""
+    """API helper to start markdown runs for a store.
+
+    If `jpins` is given, start exactly those (the UI multi-select). Otherwise fall
+    back to the first `count` catalogue candidates (legacy demo seeding).
+    """
 
     count: int = 3
-    store_id: str = "BTMLayout"
+    store_id: str = "BZID-1304298141"   # J24 - Essentials BTM Layout
     shadow_mode: bool = False
     demo_speed: float = 1800.0      # 1 nominal hour -> 2 seconds
     include_rte: bool = True
+    jpins: Optional[list[str]] = None

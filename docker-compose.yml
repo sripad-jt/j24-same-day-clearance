@@ -1,91 +1,63 @@
+# Same-Day Clearance stack: Temporal worker + FastAPI control plane + React web.
+#
+# Postgres is NOT run here — worker/api use the j24-pulse compose postgres
+# (service "postgres" on the external "j24-pulse_default" network), in the
+# dedicated "perishable" database. Connects to Temporal Cloud (TEMPORAL_* in .env).
+#
+# No host ports are published — to avoid clashing with j24-pulse / j24-store-vision
+# / parallax. The web container (j24-clearance-web on the parallax_app network) is
+# served under https://parallax.jumbotail.com/j24-clearance/ via the parallax
+# nginx, and proxies its own /api/ to the FastAPI gateway.
+#
+#   docker compose up --build -d            # worker + api + web
+#
+# Env comes from .env (see .env.example). DATABASE_URL below overrides .env.
+
 services:
-  # --- Postgres: app read-model + Temporal's own databases -----------------
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: perishable
-      POSTGRES_PASSWORD: perishable
-      POSTGRES_DB: perishable
-    ports:
-      - "5432:5432"
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U perishable"]
-      interval: 5s
-      timeout: 5s
-      retries: 10
-
-  # --- Temporal dev cluster (auto-setup creates its schemas on postgres) ----
-  temporal:
-    image: temporalio/auto-setup:1.25.2
-    environment:
-      DB: postgres12
-      DB_PORT: 5432
-      POSTGRES_USER: perishable
-      POSTGRES_PWD: perishable
-      POSTGRES_SEEDS: postgres
-    ports:
-      - "7233:7233"
-    depends_on:
-      postgres:
-        condition: service_healthy
-    restart: unless-stopped
-
-  temporal-ui:
-    image: temporalio/ui:2.34.0
-    environment:
-      TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_CORS_ORIGINS: http://localhost:8081
-    ports:
-      - "8081:8080"
-    depends_on:
-      - temporal
-    restart: unless-stopped
-
   # --- Our worker + control-plane API (shared image) ------------------------
   worker:
     build: .
     image: perishable-offers:latest
+    env_file: .env
     environment:
-      DATABASE_URL: postgresql+psycopg://perishable:perishable@postgres:5432/perishable
-      TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_NAMESPACE: default
-      TEMPORAL_TASK_QUEUE: perishables-tq
+      DATABASE_URL: postgresql+psycopg://aira:aira@postgres:5432/clearance
     command: ["python", "worker.py"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-      temporal:
-        condition: service_started
     restart: unless-stopped
+    networks:
+      - default
+      - pulsedb
 
   api:
     build: .
     image: perishable-offers:latest
+    env_file: .env
     environment:
-      DATABASE_URL: postgresql+psycopg://perishable:perishable@postgres:5432/perishable
-      TEMPORAL_ADDRESS: temporal:7233
-      TEMPORAL_NAMESPACE: default
-      TEMPORAL_TASK_QUEUE: perishables-tq
+      DATABASE_URL: postgresql+psycopg://aira:aira@postgres:5432/clearance
     command: ["uvicorn", "api.main:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports:
-      - "8000:8000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      temporal:
-        condition: service_started
     restart: unless-stopped
+    networks:
+      - default
+      - pulsedb
 
   web:
     build: ./web
     image: perishable-offers-web:latest
-    ports:
-      - "8080:80"
+    container_name: j24-clearance-web
     depends_on:
       - api
     restart: unless-stopped
+    networks:
+      - default
+      - parallax
 
-volumes:
-  pgdata:
+networks:
+  # Internal network for web -> api traffic.
+  default:
+  # j24-pulse's compose network, where its postgres service lives.
+  pulsedb:
+    external: true
+    name: j24-pulse_default
+  # parallax's compose network, so its nginx can proxy to j24-clearance-web.
+  parallax:
+    external: true
+    name: parallax_app

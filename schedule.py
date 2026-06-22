@@ -3,8 +3,8 @@
 The schedule fans out one markdown run per perishable candidate each morning.
 For the demo it starts a run per candidate in the pilot catalogue.
 
-    python schedule.py --store BTMLayout          # create daily sweep
-    python schedule.py --store BTMLayout --delete  # remove it
+    python schedule.py --store BZID-1304298141          # create daily sweep
+    python schedule.py --store BZID-1304298141 --delete  # remove it
 """
 from __future__ import annotations
 
@@ -27,7 +27,7 @@ from workflows.markdown import PerishableMarkdownWorkflow
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--store", default="BTMLayout")
+    ap.add_argument("--store", default="BZID-1304298141")
     ap.add_argument("--delete", action="store_true")
     ap.add_argument("--speed", type=float, default=1800.0)
     args = ap.parse_args()

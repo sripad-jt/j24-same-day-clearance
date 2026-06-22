@@ -1,28 +1,82 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, poll } from "../api";
-import type { RunSummary } from "../types";
+import type { Candidate, InventoryItem, RunSummary, Store } from "../types";
 
 const fmt = (n: number) => `₹${(+n).toFixed(n % 1 ? 2 : 0)}`;
+const DEFAULT_STORE = "BZID-1304298141"; // J24 - Essentials BTM Layout
 
 export default function Dashboard() {
   const [runs, setRuns] = useState<RunSummary[]>([]);
-  const [count, setCount] = useState(6);
+  const [stores, setStores] = useState<Store[]>([]);
+  const [storeId, setStoreId] = useState(DEFAULT_STORE);
+  const [storeFilter, setStoreFilter] = useState("");
+  const [candidates, setCandidates] = useState<Candidate[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [inv, setInv] = useState<Record<string, InventoryItem>>({});
+  const [invSource, setInvSource] = useState<string>("");
+  const [invLoading, setInvLoading] = useState(false);
   const [speed, setSpeed] = useState(1800);
   const [shadow, setShadow] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => poll(api.listRuns, 2000, setRuns), []);
+  useEffect(() => {
+    api.listStores().then(setStores).catch(() => {});
+  }, []);
 
-  const seed = async () => {
+  // Load (and default-select) the leafy-green candidates whenever the store changes.
+  useEffect(() => {
+    api
+      .listCandidates(storeId)
+      .then((r) => {
+        setCandidates(r.candidates);
+        setSelected(new Set(r.candidates.map((c) => c.jpin)));
+      })
+      .catch(() => {});
+  }, [storeId]);
+
+  // Pull the live inventory snapshot (real on-hand + listing price) per store.
+  useEffect(() => {
+    setInv({});
+    setInvSource("");
+    setInvLoading(true);
+    api
+      .getInventory(storeId)
+      .then((r) => {
+        setInv(Object.fromEntries(r.items.map((i) => [i.jpin, i])));
+        setInvSource(r.source);
+      })
+      .catch(() => setInvSource("error"))
+      .finally(() => setInvLoading(false));
+  }, [storeId]);
+
+  const visibleStores = useMemo(() => {
+    const q = storeFilter.trim().toLowerCase();
+    if (!q) return stores;
+    return stores.filter(
+      (s) => s.name.toLowerCase().includes(q) || s.store_id.toLowerCase().includes(q)
+    );
+  }, [stores, storeFilter]);
+
+  const toggle = (jpin: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      next.has(jpin) ? next.delete(jpin) : next.add(jpin);
+      return next;
+    });
+  const allSelected = candidates.length > 0 && selected.size === candidates.length;
+  const toggleAll = () =>
+    setSelected(allSelected ? new Set() : new Set(candidates.map((c) => c.jpin)));
+
+  const start = async () => {
     setBusy(true);
     try {
       await api.seed({
-        count,
-        store_id: "BTMLayout",
+        store_id: storeId,
+        jpins: [...selected],
         shadow_mode: shadow,
         demo_speed: speed,
-        include_rte: true,
       });
       setRuns(await api.listRuns());
     } finally {
@@ -33,21 +87,28 @@ export default function Dashboard() {
   return (
     <div>
       <div className="card">
-        <h3>Seed demo runs</h3>
+        <h3>Start clearance runs</h3>
         <p className="muted">
-          Starts one durable Temporal workflow per perishable batch. With a high
-          clock-speed a full 13-hour selling day replays in ~30s.
+          Pick a store, choose the leafy greens (L=1, must clear today), and start
+          one durable Temporal workflow per line. High clock-speed replays a full
+          selling day in ~30s.
         </p>
         <div className="row">
-          <label>
-            Batches
+          <label style={{ flex: "1 1 320px" }}>
+            Store
             <input
-              type="number"
-              min={1}
-              max={6}
-              value={count}
-              onChange={(e) => setCount(+e.target.value)}
+              type="text"
+              placeholder="Filter stores…"
+              value={storeFilter}
+              onChange={(e) => setStoreFilter(e.target.value)}
             />
+            <select value={storeId} onChange={(e) => setStoreId(e.target.value)}>
+              {visibleStores.map((s) => (
+                <option key={s.store_id} value={s.store_id}>
+                  {s.name} ({s.store_id})
+                </option>
+              ))}
+            </select>
           </label>
           <label>
             Clock speed (×)
@@ -66,8 +127,77 @@ export default function Dashboard() {
             />
             Shadow mode (no price writes)
           </label>
-          <button onClick={seed} disabled={busy}>
-            {busy ? "Seeding…" : "Seed runs"}
+        </div>
+
+        <div className="row spread" style={{ marginTop: 12, alignItems: "center" }}>
+          <h4 style={{ margin: 0 }}>Leafy greens</h4>
+          <span className="muted">
+            sell-through source:{" "}
+            <span className={`chip ${invSource === "live" ? "s-OBSERVING" : ""}`}>
+              {invLoading ? "loading…" : invSource || "—"}
+            </span>
+            {invSource === "live" && " (live OUTWARDED count)"}
+            {invSource === "error" && " (API unavailable)"}
+          </span>
+        </div>
+        <table style={{ marginTop: 8 }}>
+          <thead>
+            <tr>
+              <th style={{ width: 32 }}>
+                <input type="checkbox" checked={allSelected} onChange={toggleAll} />
+              </th>
+              <th>Leafy green</th>
+              <th>JPIN</th>
+              <th>Sold (24h)</th>
+              <th>List price</th>
+            </tr>
+          </thead>
+          <tbody>
+            {candidates.map((c) => {
+              const sold = inv[c.jpin]?.sold;
+              return (
+                <tr key={c.jpin}>
+                  <td>
+                    <input
+                      type="checkbox"
+                      checked={selected.has(c.jpin)}
+                      onChange={() => toggle(c.jpin)}
+                    />
+                  </td>
+                  <td>{c.product_title}</td>
+                  <td className="muted">{c.jpin}</td>
+                  <td>
+                    {sold != null ? (
+                      sold.toLocaleString()
+                    ) : invLoading ? (
+                      "…"
+                    ) : (
+                      <span className="muted" title="OUTWARDED query timed out (high-volume SKU)">
+                        —
+                      </span>
+                    )}
+                  </td>
+                  <td title="placeholder — API listingSellingPrice is ₹1">
+                    {fmt(c.list_price)}<span className="muted"> *</span>
+                  </td>
+                </tr>
+              );
+            })}
+            {candidates.length === 0 && (
+              <tr>
+                <td colSpan={5} className="muted">
+                  No leafy-green candidates for this store.
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+
+        <div className="row" style={{ marginTop: 12 }}>
+          <button onClick={start} disabled={busy || selected.size === 0}>
+            {busy
+              ? "Starting…"
+              : `Start ${selected.size} clearance run${selected.size === 1 ? "" : "s"}`}
           </button>
         </div>
       </div>

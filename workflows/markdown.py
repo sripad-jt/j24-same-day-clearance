@@ -40,7 +40,9 @@ with workflow.unsafe.imports_passed_through():
 
 # Activity option presets (design §7 retry/timeout matrix).
 _READ = dict(
-    start_to_close_timeout=timedelta(seconds=15),
+    # Generous start-to-close: fetch_sellthrough makes a live OUTWARDED count call
+    # (~26-30s for slow movers) before falling back to the synthetic curve.
+    start_to_close_timeout=timedelta(seconds=40),
     retry_policy=RetryPolicy(maximum_attempts=3),
 )
 _NOTIFY = dict(
@@ -135,7 +137,7 @@ class PerishableMarkdownWorkflow:
             current_pct = rungs[current_rung_index].ceiling_pct
             st = await workflow.execute_activity(
                 fetch_sellthrough,
-                args=[jpin, self._state.q0, cp.nominal_elapsed_h, total_h,
+                args=[store_id, jpin, self._state.q0, cp.nominal_elapsed_h, total_h,
                       cfg.trailing_window_hours, current_pct],
                 **_READ,
             )

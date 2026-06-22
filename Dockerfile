@@ -9,7 +9,8 @@ RUN pip install --no-cache-dir uv
 COPY pyproject.toml ./
 RUN uv pip install --system --no-cache \
     "temporalio>=1.8.0" "pydantic>=2.0" "fastapi>=0.110" \
-    "uvicorn[standard]>=0.29" "sqlalchemy>=2.0" "psycopg[binary]>=3.1"
+    "uvicorn[standard]>=0.29" "sqlalchemy>=2.0" "psycopg[binary]>=3.1" \
+    "httpx>=0.27"
 
 COPY . .
 

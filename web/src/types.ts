@@ -1,3 +1,36 @@
+export interface Store {
+  store_id: string;
+  name: string;
+  org_id: string;
+  facility_id: string;
+  city: string;
+}
+
+export interface Candidate {
+  jpin: string;
+  product_title: string;
+  category: string;
+  is_rte: boolean;
+  shelf_life_days: number;
+  list_price: number;
+  mrp: number;
+}
+
+export interface InventoryItem {
+  jpin: string;
+  product_title: string;
+  sold: number | null;
+  hours: number;
+}
+
+export interface InventorySnapshot {
+  store: Store | null;
+  facility_id: string | null;
+  source: "live" | "stub" | "error";
+  hours: number;
+  items: InventoryItem[];
+}
+
 export interface RunSummary {
   run_id: string;
   store_id: string;

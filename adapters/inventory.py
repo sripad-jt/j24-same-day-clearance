@@ -5,13 +5,80 @@ Real impl calls POST .../space/product/details/for-state-status-facility:
     on-hand (leftQty), received time, listingSellingPrice, expiry (via lotId)
   - OUTWARDED (createdTimeAfter within 2 days) -> units sold since T0
 
-This stub synthesises a deterministic intraday sell-through curve per JPIN so the
-projection in the decision engine actually moves: some lines clear on their own
-(HOLD), others lag (STEP). A markdown gives a modest demand boost.
+The LIVE functions (`live_units_sold`, `live_sold_snapshot`) call the real gateway
+via `adapters/_bolt`. They read sell-through as the COUNT of OUTWARDED movements
+over a window (active leftQty doesn't decrement on sale). Best-effort: callers
+fall back to the synthetic curve below on timeout. Gated by INVENTORY_SOURCE=live.
+
+The synthetic stub below synthesises a deterministic intraday sell-through curve
+per JPIN so the projection in the decision engine actually moves: some lines
+clear on their own (HOLD), others lag (STEP). A markdown gives a demand boost.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
+import logging
+import time
+
+from adapters import _bolt
+
+log = logging.getLogger("inventory")
+
+
+# --------------------------------------------------------------------------- #
+# LIVE — real reads from the Inventory Item Details API
+# --------------------------------------------------------------------------- #
+def live_enabled() -> bool:
+    return _bolt.configured()
+
+
+async def live_units_sold(
+    jpin: str, facility_id: str, since_ms: int, timeout: float = 30.0
+) -> int | None:
+    """Real units sold since `since_ms` (epoch ms) = sell-through over the window.
+
+    Sales are recorded as OUTWARDED movements (active `leftQty` does NOT decrement
+    on sale), so sell-through is the COUNT of OUTWARDED units, not a stock figure.
+    Uses the lightweight count endpoint. Best-effort: returns None on timeout/error
+    (the OUTWARDED scan is slow server-side and times out for high-volume sellers)
+    so callers can fall back. `since_ms` must be >= now - 2 days (gateway rule).
+    """
+    try:
+        data = await _bolt.counts(
+            [jpin], facility_id, _bolt.OUTWARDED_STATES, _bolt.OUTWARDED_STATUSES,
+            created_after_ms=since_ms, timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort live read
+        log.warning("live_units_sold(%s) failed: %s", jpin, e)
+        return None
+    return int(data.get(jpin) or 0)
+
+
+async def live_sold_snapshot(
+    jpins: list[str], facility_id: str, hours: float, timeout: float = 30.0
+) -> dict[str, dict]:
+    """Real units sold per JPIN over the last `hours` — fanned out per JPIN.
+
+    Returns {jpin: {"sold": int|None, "hours": hours}} ("sold" is None when that
+    JPIN's OUTWARDED query timed out). `since_ms` is computed from the real clock
+    (fine — this runs in an activity / the API, never the workflow).
+    """
+    since_ms = int((time.time() - hours * 3600) * 1000)
+    results = await asyncio.gather(
+        *(live_units_sold(j, facility_id, since_ms, timeout) for j in jpins),
+        return_exceptions=True,
+    )
+    out: dict[str, dict] = {}
+    for j, r in zip(jpins, results):
+        sold = None if isinstance(r, Exception) else r
+        out[j] = {"sold": sold, "hours": hours}
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# SYNTHETIC — deterministic fallback for demos/tests
+# --------------------------------------------------------------------------- #
 
 
 def _demand_strength(jpin: str) -> float:

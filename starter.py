@@ -1,6 +1,6 @@
 """CLI: start one markdown run for a synthetic batch.
 
-    python starter.py --store BTMLayout --jpin JPIN-PALAK-001 [--shadow] [--speed 1800]
+    python starter.py --store BZID-1304298141 --jpin JPIN-1304597126 [--shadow] [--speed 1800]
 """
 from __future__ import annotations
 
@@ -16,8 +16,8 @@ from workflows.markdown import PerishableMarkdownWorkflow
 
 async def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--store", default="BTMLayout")
-    ap.add_argument("--jpin", default="JPIN-PALAK-001")
+    ap.add_argument("--store", default="BZID-1304298141")
+    ap.add_argument("--jpin", default="JPIN-1304597126")
     ap.add_argument("--date", default=date.today().isoformat())
     ap.add_argument("--shadow", action="store_true")
     ap.add_argument("--speed", type=float, default=1800.0)
