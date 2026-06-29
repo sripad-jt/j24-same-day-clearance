@@ -328,60 +328,359 @@ Tables are auto-created via `db.database.init_db()` (SQLAlchemy `create_all`, id
 
 ---
 
-## 8. REST API (`api/main.py`)
+## 8. Internal REST API (`api/main.py`)
 
-Base URL: `http://localhost:8000`
+Base URL: `http://localhost:8000`  
+All endpoints return JSON. CORS is open (`*`). FastAPI Swagger docs at `/docs`.
 
-### Utility
+---
 
-| Method | Path | Description |
-|---|---|---|
-| `GET` | `/api/health` | Liveness check → `{"ok": true}` |
-| `GET` | `/api/config` | Default ladder config (rungs, thresholds) |
-| `GET` | `/api/stores` | Full J24 store directory (~60 stores) |
+### `GET /api/health`
 
-### Catalogue / inventory
+```json
+{ "ok": true }
+```
 
-| Method | Path | Query params | Description |
-|---|---|---|---|
-| `GET` | `/api/candidates` | `store_id` | Perishable JPINs selectable for this store |
-| `GET` | `/api/inventory` | `store_id`, `hours` | Live units-sold snapshot per JPIN over the last N hours |
+---
 
-### Runs
+### `GET /api/config`
 
-| Method | Path | Body / params | Description |
-|---|---|---|---|
-| `GET` | `/api/runs` | — | All runs (summary list, newest first) |
-| `GET` | `/api/runs/{run_id}` | — | Run detail + events + decisions + price changes + offers + live Temporal state |
-| `GET` | `/api/runs/{run_id}/audit` | — | Immutable audit trail for a run |
-| `POST` | `/api/runs/seed` | `SeedRequest` | Start one or more markdown workflows |
-| `POST` | `/api/runs/{run_id}/decision` | `OwnerDecision` | Approve or reject a pending price step |
-| `POST` | `/api/runs/{run_id}/override` | `ManualOverride` | Force a rung or stop the run |
-| `POST` | `/api/runs/{run_id}/grn` | `AdditionalGrn` | Rebase Q0 with additional received stock |
-| `POST` | `/api/runs/{run_id}/soldout` | — | Mark the line as sold out |
+Returns the default ladder config snapshotted into every new workflow run.
 
-#### `POST /api/runs/seed` — `SeedRequest`
 ```json
 {
-  "count": 3,
+  "rungs": [
+    { "index": 0, "label": "R0", "elapsed_hours": 0.0,  "wallclock_hour_ist": null, "ceiling_pct": 0.0,   "token_free": false },
+    { "index": 1, "label": "R1", "elapsed_hours": 2.0,  "wallclock_hour_ist": null, "ceiling_pct": 25.0,  "token_free": false },
+    { "index": 2, "label": "R2", "elapsed_hours": 8.0,  "wallclock_hour_ist": 16,   "ceiling_pct": 50.0,  "token_free": false },
+    { "index": 3, "label": "R3", "elapsed_hours": null, "wallclock_hour_ist": 21,   "ceiling_pct": 100.0, "token_free": true  }
+  ],
+  "theta_hold": 0.85,
+  "trailing_window_hours": 1.5,
+  "min_q0": 5,
+  "giveaway_alert_qty": 50,
+  "approval_timeout_minutes": 30,
+  "rte_autoclear_gate_hour": 20,
+  "store_close_hour": 21,
+  "token_free_price": 1.0,
+  "enable_llm": false,
+  "shadow_mode": false,
+  "demo_speed": 1.0
+}
+```
+
+---
+
+### `GET /api/stores`
+
+Returns the full J24 store directory (~60 stores). Used by the store picker in the React app.
+
+```json
+[
+  {
+    "store_id": "BZID-1304298141",
+    "name": "J24 - Essentials BTM Layout",
+    "org_id": "ORGPROF-1304467107",
+    "facility_id": "FACIL-1441684082",
+    "city": "Bengaluru"
+  },
+  {
+    "store_id": "BZID-1304712034",
+    "name": "J24 - Essentials Balaji Layout",
+    "org_id": "ORGPROF-1304468146",
+    "facility_id": "FACIL-1441684284",
+    "city": "Bengaluru"
+  }
+]
+```
+
+---
+
+### `GET /api/candidates?store_id=BZID-1304298141`
+
+Returns perishable JPINs available for selection for a store. Product-level catalogue — same set is available across all stores; `store_id` identifies the facility for downstream inventory reads.
+
+```json
+{
+  "store": {
+    "store_id": "BZID-1304298141",
+    "name": "J24 - Essentials BTM Layout",
+    "org_id": "ORGPROF-1304467107",
+    "facility_id": "FACIL-1441684082",
+    "city": "Bengaluru"
+  },
+  "candidates": [
+    { "jpin": "JPIN-1304597126", "product_title": "Coriander Leaves Bunch",  "category": "FNV_LEAFY", "is_rte": false, "shelf_life_days": 1, "list_price": 15.0, "mrp": 20.0 },
+    { "jpin": "JPIN-1304597236", "product_title": "Curry Leaves",            "category": "FNV_LEAFY", "is_rte": false, "shelf_life_days": 1, "list_price": 12.0, "mrp": 15.0 },
+    { "jpin": "JPIN-1304597122", "product_title": "Mint / Pudina Leaves",    "category": "FNV_LEAFY", "is_rte": false, "shelf_life_days": 1, "list_price": 15.0, "mrp": 20.0 },
+    { "jpin": "JPIN-1304597163", "product_title": "Spinach Leaves",          "category": "FNV_LEAFY", "is_rte": false, "shelf_life_days": 1, "list_price": 25.0, "mrp": 30.0 },
+    { "jpin": "JPIN-1304597127", "product_title": "Methi Leaves",            "category": "FNV_LEAFY", "is_rte": false, "shelf_life_days": 1, "list_price": 29.0, "mrp": 35.0 }
+  ]
+}
+```
+
+---
+
+### `GET /api/inventory?store_id=BZID-1304298141&hours=24`
+
+Live units sold per JPIN over the last `hours`. Calls the Bolt Gateway OUTWARDED count for each JPIN. `source` is `"live"` (real), `"stub"` (live disabled), or `"error"` (gateway exception). `sold` is `null` for JPINs whose OUTWARDED query timed out.
+
+```json
+{
+  "store": { "store_id": "BZID-1304298141", "name": "J24 - Essentials BTM Layout", "facility_id": "FACIL-1441684082" },
+  "facility_id": "FACIL-1441684082",
+  "source": "live",
+  "hours": 24.0,
+  "items": [
+    { "jpin": "JPIN-1304597126", "product_title": "Coriander Leaves Bunch", "sold": 18,   "hours": 24.0 },
+    { "jpin": "JPIN-1304597236", "product_title": "Curry Leaves",           "sold": null, "hours": 24.0 },
+    { "jpin": "JPIN-1304597122", "product_title": "Mint / Pudina Leaves",   "sold": 9,    "hours": 24.0 }
+  ]
+}
+```
+
+---
+
+### `GET /api/runs`
+
+All markdown runs, newest first.
+
+```json
+[
+  {
+    "run_id": "perish-markdown-BZID-1304298141-JPIN-1304597126-2026-06-29",
+    "store_id": "BZID-1304298141",
+    "jpin": "JPIN-1304597126",
+    "receipt_date": "2026-06-29",
+    "clearance_date": "2026-06-29",
+    "product_title": "Coriander Leaves Bunch",
+    "category": "FNV_LEAFY",
+    "is_rte": false,
+    "status": "AWAITING_APPROVAL",
+    "current_rung": "R1",
+    "list_price": 15.0,
+    "current_price": 11.25,
+    "q0": 42,
+    "units_sold": 14,
+    "awaiting_approval": true,
+    "shadow_mode": false,
+    "summary": "slightly short (proj 36/42, ratio 0.86) — step to R2",
+    "updated_at": "2026-06-29T10:03:41+00:00"
+  }
+]
+```
+
+---
+
+### `GET /api/runs/{run_id}`
+
+Full run detail. Merges the Postgres read-model with a live Temporal `current_state` query. `live` is `null` if the workflow has finished or is unreachable.
+
+```json
+{
+  "run_id": "perish-markdown-BZID-1304298141-JPIN-1304597126-2026-06-29",
+  "store_id": "BZID-1304298141",
+  "jpin": "JPIN-1304597126",
+  "receipt_date": "2026-06-29",
+  "clearance_date": "2026-06-29",
+  "product_title": "Coriander Leaves Bunch",
+  "category": "FNV_LEAFY",
+  "is_rte": false,
+  "status": "AWAITING_APPROVAL",
+  "current_rung": "R1",
+  "list_price": 15.0,
+  "current_price": 11.25,
+  "q0": 42,
+  "units_sold": 14,
+  "awaiting_approval": true,
+  "shadow_mode": false,
+  "summary": "slightly short (proj 36/42, ratio 0.86) — step to R2",
+  "updated_at": "2026-06-29T10:03:41+00:00",
+
+  "events": [
+    { "kind": "STARTED",            "message": "Coriander Leaves Bunch · Q0=42 · list ₹15 · live", "ts": "2026-06-29T08:00:01+00:00" },
+    { "kind": "AWAITING_APPROVAL",  "message": "Coriander Leaves Bunch: ₹11.25→₹7.5 (R2)",         "ts": "2026-06-29T10:02:58+00:00" }
+  ],
+
+  "decisions": [
+    {
+      "rung": "R0", "price": 15.0, "units_sold": 0,  "run_rate": 0.0,  "ratio": 1.0,  "residual": 0.0,
+      "decision": "HOLD", "approval": "NOT_REQUIRED",
+      "reason": "on track to clear (proj 42 ≥ 42 on hand) — hold at R0",
+      "ts": "2026-06-29T08:00:02+00:00"
+    },
+    {
+      "rung": "R2", "price": 7.5, "units_sold": 14, "run_rate": 3.2, "ratio": 0.86, "residual": 6.0,
+      "decision": "STEP", "approval": "PENDING",
+      "reason": "slightly short (proj 36/42, ratio 0.86) — step to R2",
+      "ts": "2026-06-29T10:02:57+00:00"
+    }
+  ],
+
+  "price_changes": [
+    { "rung": "R1", "from_price": 15.0, "to_price": 11.25, "confirmed": true, "ts": "2026-06-29T09:45:00+00:00" }
+  ],
+
+  "offers": [
+    { "rung": "R1", "headline": "Fresh Deal — Coriander Leaves Bunch, 25% off till close", "price": 11.25, "channel": "retail_media", "ts": "2026-06-29T09:45:01+00:00" }
+  ],
+
+  "live": {
+    "current_rung": "R1",
+    "current_price": 11.25,
+    "q0": 42,
+    "units_sold": 14,
+    "run_rate": 3.2,
+    "projected_clearance": 36.0,
+    "residual": 6.0,
+    "ratio": 0.86,
+    "status": "AWAITING_APPROVAL",
+    "awaiting_approval": true,
+    "pending_rung": "R2",
+    "pending_price": 7.5,
+    "last_reason": "slightly short (proj 36/42, ratio 0.86) — step to R2"
+  }
+}
+```
+
+---
+
+### `GET /api/runs/{run_id}/audit`
+
+Immutable per-checkpoint audit trail. Each entry is a full `AuditEvent` serialised at write time — never overwritten.
+
+```json
+[
+  {
+    "run_id": "perish-markdown-BZID-1304298141-JPIN-1304597126-2026-06-29",
+    "store_id": "BZID-1304298141",
+    "jpin": "JPIN-1304597126",
+    "ts_ist": "2026-06-29T08:00:02+05:30",
+    "from_rung": "R0", "to_rung": "R0",
+    "from_price": 15.0, "to_price": 15.0,
+    "q0": 42, "units_sold": 0, "run_rate": 0.0,
+    "projected_clearance": 0.0, "residual": 42.0, "ratio": 0.0,
+    "decision": "HOLD",
+    "approval": "NOT_REQUIRED",
+    "reason": "on track to clear (proj 42 ≥ 42 on hand) — hold at R0"
+  },
+  {
+    "run_id": "perish-markdown-BZID-1304298141-JPIN-1304597126-2026-06-29",
+    "store_id": "BZID-1304298141",
+    "jpin": "JPIN-1304597126",
+    "ts_ist": "2026-06-29T10:02:57+05:30",
+    "from_rung": "R1", "to_rung": "R2",
+    "from_price": 11.25, "to_price": 7.5,
+    "q0": 42, "units_sold": 14, "run_rate": 3.2,
+    "projected_clearance": 36.0, "residual": 6.0, "ratio": 0.857,
+    "decision": "STEP",
+    "approval": "APPROVED",
+    "reason": "slightly short (proj 36/42, ratio 0.86) — step to R2"
+  }
+]
+```
+
+---
+
+### `POST /api/runs/seed`
+
+Start one or more markdown workflows.
+
+**Request**
+```json
+{
   "store_id": "BZID-1304298141",
   "shadow_mode": false,
   "demo_speed": 1800.0,
   "include_rte": true,
-  "jpins": ["JPIN-1304597126", "JPIN-1304597236"]
+  "jpins": ["JPIN-1304597126", "JPIN-1304597236", "JPIN-1304597122"]
 }
 ```
-`jpins` overrides `count` — pass the UI multi-select list directly. `demo_speed=1800` replays 1 nominal hour in 2 seconds.
 
-#### `POST /api/runs/{run_id}/decision` — `OwnerDecision`
+| Field | Default | Notes |
+|---|---|---|
+| `store_id` | `BZID-1304298141` | BTM Layout |
+| `shadow_mode` | `false` | `true` → record recommendations, never write prices |
+| `demo_speed` | `1800.0` | 1 nominal hour = 2 s at `1800`; `1.0` = real time |
+| `include_rte` | `true` | Whether to include RTE (Ready-to-Eat) lines |
+| `jpins` | `null` | UI multi-select — overrides `count`. Validated against catalogue. |
+| `count` | `3` | Fallback: first N catalogue candidates (ignored when `jpins` is set) |
+
+**Response**
+```json
+{
+  "started": [
+    "perish-markdown-BZID-1304298141-JPIN-1304597126-2026-06-29",
+    "perish-markdown-BZID-1304298141-JPIN-1304597236-2026-06-29",
+    "perish-markdown-BZID-1304298141-JPIN-1304597122-2026-06-29"
+  ]
+}
+```
+
+---
+
+### `POST /api/runs/{run_id}/decision`
+
+Approve or reject a pending price step. Delivers `owner_decision` signal to the workflow.
+
+**Request**
 ```json
 { "rung": "R2", "approve": true, "note": "ok to mark down" }
 ```
 
-#### `POST /api/runs/{run_id}/override` — `ManualOverride`
+**Response**
+```json
+{ "ok": true }
+```
+
+If the workflow is not running: `404 { "detail": "run not running: ..." }`.
+
+---
+
+### `POST /api/runs/{run_id}/override`
+
+Force a specific rung or stop the run entirely.
+
+**Request — force rung**
 ```json
 { "action": "force_rung", "rung": "R3" }
+```
+
+**Request — stop**
+```json
 { "action": "stop" }
+```
+
+**Response**
+```json
+{ "ok": true }
+```
+
+---
+
+### `POST /api/runs/{run_id}/grn`
+
+Rebase opening stock mid-day (additional received batch). Increments `q0` and re-runs the sell-through projection at the next checkpoint.
+
+**Request**
+```json
+{ "qty": 20, "note": "second morning delivery" }
+```
+
+**Response**
+```json
+{ "ok": true }
+```
+
+---
+
+### `POST /api/runs/{run_id}/soldout`
+
+Mark the line as sold out. Terminates the workflow early with `status = SOLD_OUT`.
+
+**Response**
+```json
+{ "ok": true }
 ```
 
 ---
@@ -580,7 +879,310 @@ Unit tests cover the decision engine's determinism guarantee:
 
 ---
 
-## 16. Production readiness backlog
+## 16. External APIs — full reference with sample payloads
+
+### 16.1 Bolt Gateway — Inventory Item Details (LIVE)
+
+**Service:** SpaceManagementService via Bolt Gateway  
+**Owner:** SCM team (shipped SCM-1251/1252/1253)  
+**Status:** 🟢 Live in production
+
+#### 16.1.1 `POST /api/space/product/details/for-state-status-facility`
+
+Returns full inventory-item rows for a set of JPINs at a facility, filtered by state + status. Used in this system to read `listingSellingPrice` from active stock at run start.
+
+**Request headers**
+```
+userId:        sripad.rao@jumbotail.com
+orgId:         ORGPROF-1304473228
+Authorization: Bearer <gateway-jwt>
+Content-Type:  application/json
+```
+
+**Request body**
+```json
+{
+  "jpins": ["JPIN-1304597126", "JPIN-1304597236"],
+  "facilityId": "FACIL-1441684082",
+  "inventoryItemStates": ["SELLABLE", "FULFILMENT", "INWARDED", "UNDER_TRANSFER"],
+  "inventoryItemStatuses": ["ACTIVE", "ONHOLD"],
+  "maxResults": 1
+}
+```
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `jpins` | `string[]` | ✅ | One or more JPINs |
+| `facilityId` | `string` | ✅ | `FACIL-…` (or `BZID-…`) |
+| `inventoryItemStates` | `string[]` | ✅ | `SELLABLE`, `FULFILMENT`, `INWARDED`, `UNDER_TRANSFER`, `OUTWARDED` |
+| `inventoryItemStatuses` | `string[]` | ✅ | `ACTIVE`, `ONHOLD`, `EXHAUSTED` |
+| `createdTimeAfter` | `long` (epoch ms) | ⚠️ | Required + must be ≥ now − 2 days when `OUTWARDED` is in states |
+| `maxResults` | `int` | optional | Must be > 0 if provided; omit for no cap |
+
+**Sample response — 200 OK**
+```json
+{
+  "success": true,
+  "statusCode": 200,
+  "data": [
+    {
+      "inventoryItem": {
+        "inventoryItemId": "INVITM-2283292662",
+        "jpin": "JPIN-1304597126",
+        "productTitle": "Coriander Leaves Bunch",
+        "spaceBO": {
+          "facilityId": "FACIL-1441684082",
+          "bzId": "BZID-1304298141"
+        },
+        "lotId": "LOT-9912837441",
+        "listingId": "LST-7743829910",
+        "initialQty": 40,
+        "leftQty": 37,
+        "inventoryItemState": "SELLABLE",
+        "inventoryItemStatus": "ACTIVE"
+      },
+      "listingSellingPrice": 15.00,
+      "inventoryItemCreatedTime": 1778217154917,
+      "originInventoryItemId": null,
+      "originInventoryItemCreatedTime": null
+    }
+  ],
+  "error": null
+}
+```
+
+| Response field | Meaning |
+|---|---|
+| `inventoryItem` | Full `InventoryItemBO` — same shape as other Space APIs |
+| `listingSellingPrice` | Live selling price from Lot Management. `null` if no price set. This is the markdown anchor. |
+| `inventoryItemCreatedTime` | When this inventory item row was created (epoch ms) |
+| `originInventoryItemId` | Parent-lineage item id; `null` for root items created directly at the location |
+| `originInventoryItemCreatedTime` | When the origin item was created; `null` for root items |
+
+**How the system uses it:** `adapters/inventory.py::live_listing_price()` calls this with `maxResults=1` and `ACTIVE_STATES` to read one row's `listingSellingPrice`. Price is uniform across a JPIN's active rows, so one row is sufficient.
+
+---
+
+#### 16.1.2 `POST /api/space/product/count/for-state-status-facility`
+
+Lightweight counterpart — returns per-JPIN quantity totals (a small `{jpin: qty}` map) instead of full item rows. Used for all sell-through reads (OUTWARDED count = units sold).
+
+**Request body — OUTWARDED sell-through**
+```json
+{
+  "jpins": ["JPIN-1304597126"],
+  "facilityId": "FACIL-1441684082",
+  "inventoryItemStates": ["OUTWARDED"],
+  "inventoryItemStatuses": ["ACTIVE", "EXHAUSTED"],
+  "createdTimeAfter": 1778130754917
+}
+```
+
+`createdTimeAfter` is `now − window_h × 3600 × 1000` (epoch ms). Window is chosen from the 47/36/24 h ladder — widest available window that returns within the per-try budget.
+
+**Sample response — 200 OK**
+```json
+{
+  "success": true,
+  "statusCode": 200,
+  "data": {
+    "JPIN-1304597126": 12
+  },
+  "error": null
+}
+```
+
+`data[jpin]` = total quantity outward-moved in the window = **units sold**. A missing key means 0. The count endpoint is preferred over the details endpoint for sell-through because it returns ~100 bytes instead of full item rows.
+
+**How the system uses it:** `adapters/inventory.py::live_units_sold()` calls this; `activities/pipeline.py::fetch_sellthrough()` wraps it in the window-ladder retry loop.
+
+**cURL example**
+```bash
+curl -s -X POST \
+  'https://bolt.jumbotail.com/api/space/product/count/for-state-status-facility' \
+  -H 'userId: sripad.rao@jumbotail.com' \
+  -H 'orgId: ORGPROF-1304473228' \
+  -H 'Authorization: Bearer <token>' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "jpins": ["JPIN-1304597126"],
+    "facilityId": "FACIL-1441684082",
+    "inventoryItemStates": ["OUTWARDED"],
+    "inventoryItemStatuses": ["ACTIVE", "EXHAUSTED"],
+    "createdTimeAfter": 1778130754917
+  }'
+```
+
+**Error responses**
+| HTTP | Condition |
+|---|---|
+| 400 | Missing / empty `jpins`, `facilityId`, `inventoryItemStates`, or `inventoryItemStatuses` |
+| 400 | `maxResults` ≤ 0 |
+| 400 | `OUTWARDED` in states with `createdTimeAfter` absent or older than 2 days |
+
+---
+
+#### 16.1.3 OUTWARDED window ladder
+
+The OUTWARDED scan is slow server-side for high-volume JPINs. `fetch_sellthrough` retries widest-first across a configurable ladder, splitting a fixed budget across attempts:
+
+```
+Default windows:    47 h → 36 h → 24 h
+Total budget:       36 s  (split evenly across windows, min 8 s each)
+Hard ceiling:       47 h  (gateway rejects createdTimeAfter > 48 h — 47 h leaves margin)
+Fallback:           synthetic sell-through curve, low_confidence = True
+```
+
+```python
+# activities/pipeline.py — abbreviated
+windows = _sellthrough_windows_h()          # [47.0, 36.0, 24.0]
+per_try = max(8.0, 36.0 / len(windows))    # 12 s each
+for window_h in windows:
+    sold = await inventory.live_units_sold(
+        jpin, facility_id, _since_ms(window_h), timeout=per_try
+    )
+    if sold is not None:
+        return SellThrough(units_sold=sold, run_rate=sold/elapsed_h)
+# all timed out → fall back to synthetic
+```
+
+---
+
+### 16.2 Golden Eye — price write (STUB)
+
+**Endpoint (to be wired):** internal price-write API  
+**Status:** 🟡 Stub — always confirms
+
+```python
+# adapters/goldeneye.py — current stub
+def apply_price(store_id: str, jpin: str, rung: str, to_price: float) -> bool:
+    return True   # real impl: POST to Golden Eye, return confirmation bool
+```
+
+**Expected real call shape (to implement)**
+```json
+POST /api/price/apply
+{
+  "store_id": "BZID-1304298141",
+  "jpin": "JPIN-1304597126",
+  "rung": "R2",
+  "price": 7.50,
+  "run_id": "perish-markdown-BZID-1304298141-JPIN-1304597126-2026-06-29"
+}
+```
+
+**Expected response**
+```json
+{ "confirmed": true, "applied_at": 1778217200000 }
+```
+
+Idempotency is enforced at the DB layer: `db.repo.record_price_change()` uses a `UNIQUE (run_id, rung)` constraint, so retries from Temporal's at-least-once delivery never double-apply a price.
+
+---
+
+### 16.3 My J24 — owner notifications (STUB)
+
+**Service:** `notification.prod.jumbotail.com`  
+**Status:** 🟡 Stub — logs only
+
+Two call shapes:
+
+**Approval card** (sent when the workflow needs the owner's decision)
+```python
+# adapters/notify.py — stub
+def push_approval_card(store_id, jpin, product, from_price, to_price, units_left, reason) -> str:
+    # real impl: POST push notification / card to My J24 owner app
+    pass
+```
+
+**Sample card payload (to implement)**
+```json
+{
+  "store_id": "BZID-1304298141",
+  "jpin": "JPIN-1304597126",
+  "product": "Coriander Leaves Bunch",
+  "from_price": 15.0,
+  "to_price": 7.5,
+  "units_left": 28,
+  "reason": "lagging badly (proj 34/40, ratio 0.72) — take ceiling R2",
+  "approve_url": "POST /api/runs/perish-markdown-.../decision  {\"rung\":\"R2\",\"approve\":true}",
+  "reject_url":  "POST /api/runs/perish-markdown-.../decision  {\"rung\":\"R2\",\"approve\":false}"
+}
+```
+
+**Post-hoc notification** (sent after RTE auto-clear)
+```python
+def notify_owner(store_id: str, message: str) -> None:
+    # "Coriander Leaves Bunch: RTE auto-cleared to ₹1 at close."
+    pass
+```
+
+---
+
+### 16.4 Retail media / POS second screen (STUB)
+
+**Service:** AMP platform (Vaibhav's team) + POS second screen  
+**Status:** 🟡 Stub — returns the payload dict
+
+```python
+# adapters/retailmedia.py — stub
+def publish_offer(store_id: str, jpin: str, headline: str, price: float) -> dict:
+    return {
+        "store_id": "BZID-1304298141",
+        "jpin": "JPIN-1304597126",
+        "headline": "Fresh Deal — Coriander Leaves Bunch, 50% off till close",
+        "price": 7.5,
+        "qr_cta": "https://j24.deal/JPIN-1304597126",
+        "channels": ["retail_media", "pos_second_screen"]
+    }
+```
+
+**Expected real call shape (to implement)**
+```json
+POST /api/offers/publish
+{
+  "store_id": "BZID-1304298141",
+  "jpin": "JPIN-1304597126",
+  "headline": "Fresh Deal — Coriander Leaves Bunch, 50% off till close",
+  "price": 7.50,
+  "valid_until": "2026-06-29T21:00:00+05:30",
+  "channels": ["retail_media", "pos_second_screen"],
+  "qr_cta": "https://j24.deal/JPIN-1304597126"
+}
+```
+
+---
+
+### 16.5 LLM — offer copy (STUB with template fallback)
+
+**Status:** 🟡 Stub — deterministic template (off the price path by design)
+
+The LLM is entirely optional and must never block a markdown. `shape_offer_llm` activity has `maximum_attempts=1` and an 8-second timeout; on any failure it falls back to the template below.
+
+```python
+# adapters/copy_llm.py — template fallback (always active when enable_llm=False)
+def offer_copy(product: str, pct_off: float, token_free: bool, enable_llm: bool) -> str:
+    if token_free:
+        return f"Closing soon — {product} at a token ₹1. Grab it before we shut!"
+    if pct_off <= 0:
+        return f"Fresh today: {product}"
+    return f"Fresh Deal — {product}, {pct_off:g}% off till close"
+```
+
+**Sample outputs**
+
+| Scenario | Output |
+|---|---|
+| R1 — 25% off | `"Fresh Deal — Coriander Leaves Bunch, 25% off till close"` |
+| R2 — 50% off | `"Fresh Deal — Coriander Leaves Bunch, 50% off till close"` |
+| R3 — token ₹1 | `"Closing soon — Coriander Leaves Bunch at a token ₹1. Grab it before we shut!"` |
+| R0 — no discount | `"Fresh today: Coriander Leaves Bunch"` |
+
+Enable the real LLM by setting `enable_llm=True` in `MarkdownConfig` (passed via `SeedRequest` or `default_config(enable_llm=True)`).
+
+---
+
+## 17. Production readiness backlog
 
 See `docs/PROD_READINESS_BACKLOG.md` for the full list. Priority items:
 
