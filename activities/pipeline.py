@@ -26,12 +26,38 @@ from shared.stores import get_store
 T0_HOUR_IST = 8
 
 
-def _sellthrough_window_h() -> float:
-    """Hours of OUTWARDED history to count as the live sell-through window."""
-    try:
-        return float(os.getenv("INVENTORY_SELLTHROUGH_WINDOW_H", "24"))
-    except ValueError:
-        return 24.0
+# Widest-first OUTWARDED window ladder (hours). We try the widest (most complete)
+# window first and fall back to narrower, cheaper scans if it times out — the
+# OUTWARDED scan is slow for high-volume JPINs. All stay strictly UNDER the
+# gateway's 48h (2-day) hard cap on createdTimeAfter (48h itself risks rejection
+# from clock skew, so the widest rung is 47h).
+_DEFAULT_SELLTHROUGH_WINDOWS_H = (47.0, 36.0, 24.0)
+_MAX_WINDOW_H = 47.0  # hard ceiling: gateway rejects createdTimeAfter older than 48h
+
+# Total wall-clock budget (s) for the live read ladder per checkpoint, split
+# across the windows. Kept under the _READ activity start_to_close in the workflow.
+_LIVE_READ_BUDGET_S = 36.0
+
+
+def _sellthrough_windows_h() -> list[float]:
+    """OUTWARDED window ladder in hours, widest first.
+
+    Override via INVENTORY_SELLTHROUGH_WINDOWS_H (comma-separated, e.g. "47,36,24").
+    Values at/below 0 or above the 47h ceiling (gateway rejects >48h) are dropped.
+    """
+    raw = os.getenv("INVENTORY_SELLTHROUGH_WINDOWS_H")
+    if not raw:
+        return list(_DEFAULT_SELLTHROUGH_WINDOWS_H)
+    out: list[float] = []
+    for tok in raw.split(","):
+        try:
+            h = float(tok.strip())
+        except ValueError:
+            continue
+        if 0 < h <= _MAX_WINDOW_H:
+            out.append(h)
+    out.sort(reverse=True)
+    return out or list(_DEFAULT_SELLTHROUGH_WINDOWS_H)
 
 
 def _since_ms(window_h: float) -> int:
@@ -70,10 +96,19 @@ async def plan_run(
     # no trustworthy live Q0 from the Inventory API: active `leftQty` is a stale
     # 3-year lot pile (doesn't reflect sales), and OUTWARDED gives movements, not an
     # opening batch. Real sell-through (units sold) IS read live per checkpoint in
-    # fetch_sellthrough via the OUTWARDED count. Price stays the catalogue
-    # placeholder — the API's listingSellingPrice is ₹1 (unusable anchor).
+    # fetch_sellthrough via the OUTWARDED count.
     q0 = 30 + (sum(ord(c) for c in jpin) % 25)  # 30..54
+
+    # List price (the markdown anchor) IS read live: the details API now returns a
+    # real per-JPIN listingSellingPrice (e.g. ₹5–15), so snapshot it at run start.
+    # Falls back to the catalogue placeholder on timeout / disabled / no price.
     list_price = sku.list_price
+    if inventory.live_enabled():
+        facility_id = (get_store(store_id) or {}).get("facility_id")
+        if facility_id:
+            live_price = await inventory.live_listing_price(jpin, facility_id)
+            if live_price and live_price > 0:
+                list_price = live_price
 
     receipt = ReceiptContext(
         store_id=store_id, jpin=jpin, receipt_date=receipt_date,
@@ -83,7 +118,7 @@ async def plan_run(
         received_epoch_ms=0, expiry_date=receipt_date,
     )
 
-    if sku.list_price <= 0:
+    if list_price <= 0:
         return RunPlan(receipt=receipt, config=cfg, checkpoints=[],
                        close_offset_s=0.0, eligible=False,
                        skip_reason="no listing selling price")
@@ -133,19 +168,26 @@ async def fetch_sellthrough(
     if inventory.live_enabled():
         facility_id = (get_store(store_id) or {}).get("facility_id")
         if facility_id:
-            window_h = _sellthrough_window_h()
-            sold = await inventory.live_units_sold(
-                jpin, facility_id, _since_ms(window_h)
-            )
-            if sold is not None:
-                rate = sold / max(nominal_elapsed_h, 0.5)  # units / nominal hour
-                activity.logger.info(
-                    "live sell-through %s @ %s: sold=%s/%gh", jpin, facility_id,
-                    sold, window_h,
+            windows = _sellthrough_windows_h()
+            # Split the read budget across the ladder so all attempts fit within
+            # the _READ activity start_to_close timeout.
+            per_try = max(8.0, _LIVE_READ_BUDGET_S / len(windows))
+            for window_h in windows:
+                sold = await inventory.live_units_sold(
+                    jpin, facility_id, _since_ms(window_h), timeout=per_try
                 )
-                return SellThrough(units_sold=sold, run_rate=rate, low_confidence=False)
+                if sold is not None:
+                    rate = sold / max(nominal_elapsed_h, 0.5)  # units / nominal hour
+                    activity.logger.info(
+                        "live sell-through %s @ %s: sold=%s/%gh", jpin, facility_id,
+                        sold, window_h,
+                    )
+                    return SellThrough(
+                        units_sold=sold, run_rate=rate, low_confidence=False
+                    )
             activity.logger.warning(
-                "live sell-through %s timed out — synthetic fallback", jpin
+                "live sell-through %s timed out at all windows %s — synthetic fallback",
+                jpin, windows,
             )
 
     sold, rate = inventory.sell_through(

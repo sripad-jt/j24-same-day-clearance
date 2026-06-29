@@ -40,9 +40,9 @@ with workflow.unsafe.imports_passed_through():
 
 # Activity option presets (design §7 retry/timeout matrix).
 _READ = dict(
-    # Generous start-to-close: fetch_sellthrough makes a live OUTWARDED count call
-    # (~26-30s for slow movers) before falling back to the synthetic curve.
-    start_to_close_timeout=timedelta(seconds=40),
+    # Generous start-to-close: fetch_sellthrough walks a live OUTWARDED window
+    # ladder (47->36->24h, ~12s each) before falling back to the synthetic curve.
+    start_to_close_timeout=timedelta(seconds=50),
     retry_policy=RetryPolicy(maximum_attempts=3),
 )
 _NOTIFY = dict(

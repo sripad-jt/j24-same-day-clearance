@@ -25,9 +25,10 @@ class CandidateSku:
 # store only changes the facility for downstream inventory/sell-through reads).
 # All are leafy greens, master shelf-life L=1 (must clear today).
 #
-# NOTE: list_price / mrp here are PLACEHOLDERS. The live value comes from the
-# Inventory Item Details API (`listingSellingPrice`) / Lot Management master —
-# wire that in `adapters/inventory.py` to replace these.
+# NOTE: list_price / mrp here are FALLBACK PLACEHOLDERS. When INVENTORY_SOURCE=live,
+# plan_run replaces list_price with the real per-JPIN `listingSellingPrice` from the
+# Inventory Item Details API (see adapters/inventory.live_listing_price); these values
+# are only used when the live read is disabled or times out. mrp has no live source yet.
 _CATALOG: list[CandidateSku] = [
     CandidateSku("JPIN-1304597126", "Coriander Leaves Bunch", "FNV_LEAFY", False, 1, 15.0, 20.0),
     CandidateSku("JPIN-1304597236", "Curry Leaves", "FNV_LEAFY", False, 1, 12.0, 15.0),

@@ -33,6 +33,31 @@ def live_enabled() -> bool:
     return _bolt.configured()
 
 
+async def live_listing_price(
+    jpin: str, facility_id: str, timeout: float = 20.0
+) -> float | None:
+    """Real `listingSellingPrice` for a JPIN (the live markdown anchor).
+
+    Pulled from the active-state details query (SELLABLE/etc.), which is fast and
+    naturally bounded by `leftQty > 0` — unlike the OUTWARDED scan. Price is
+    uniform across a JPIN's active rows, so we cap at one row. Returns None on
+    timeout/error or when the listing has no selling price, so callers fall back
+    to the catalogue placeholder.
+    """
+    try:
+        rows = await _bolt.details(
+            [jpin], facility_id, _bolt.ACTIVE_STATES, _bolt.ACTIVE_STATUSES,
+            max_results=1, timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort live read
+        log.warning("live_listing_price(%s) failed: %s", jpin, e)
+        return None
+    if not rows:
+        return None
+    price = rows[0].get("listingSellingPrice")
+    return float(price) if price else None
+
+
 async def live_units_sold(
     jpin: str, facility_id: str, since_ms: int, timeout: float = 30.0
 ) -> int | None:
