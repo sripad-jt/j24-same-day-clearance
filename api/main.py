@@ -6,9 +6,11 @@ GRN, sold-out). The workflow remains the source of truth.
 """
 from __future__ import annotations
 
+import asyncio
+import time
 from datetime import date
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from temporalio.client import Client
 from temporalio.common import WorkflowIDReusePolicy
@@ -25,6 +27,7 @@ from shared.models import (
     ManualOverride,
     OwnerDecision,
     SeedRequest,
+    StandingRuleRequest,
 )
 from shared.stores import DEFAULT_STORE_ID, STORE_DIRECTORY, get_store
 from workflows.markdown import PerishableMarkdownWorkflow
@@ -117,41 +120,107 @@ async def get_audit(run_id: str) -> list[dict]:
     return repo.list_audit(run_id)
 
 
+# In-memory inventory cache: store_id → snapshot dict.
+# The Bolt fetch runs in a background task (up to 120s) so the HTTP response
+# returns immediately — avoiding the upstream nginx proxy timeout.
+_inv_cache: dict[str, dict] = {}
+_inv_fetching: set[str] = set()
+_BOLT_FETCH_TIMEOUT = 120.0   # seconds — Bolt can take ~80s per batch
+_CACHE_TTL = 300.0            # seconds — treat cache as fresh for 5 min
+
+
+async def _fetch_inventory_bg(
+    store_id: str, facility_id: str, jpins: list[str], titles: dict[str, str]
+) -> None:
+    """Background task: run Bolt calls for up to 2 min, then update cache."""
+    if store_id in _inv_fetching:
+        return  # already in flight
+    _inv_fetching.add(store_id)
+    t0_ms = inventory.t0_today_ms()
+    try:
+        snap = await inventory.live_sold_snapshot(
+            jpins, facility_id, t0_ms, timeout=_BOLT_FETCH_TIMEOUT
+        )
+        any_null = any(
+            v.get("sold_today") is None or v.get("inventory_at_t0") is None
+            for v in snap.values()
+        )
+        source = "partial" if any_null else "live"
+    except Exception:  # noqa: BLE001
+        snap, source = {}, "error"
+    finally:
+        _inv_fetching.discard(store_id)
+
+    items = [
+        {
+            "jpin": j,
+            "product_title": titles[j],
+            "inventory_at_t0": (snap.get(j) or {}).get("inventory_at_t0"),
+            "received_today": (snap.get(j) or {}).get("received_today"),
+            "sold_today": (snap.get(j) or {}).get("sold_today"),
+            "t0_ms": t0_ms,
+        }
+        for j in jpins
+    ]
+    _inv_cache[store_id] = {
+        "source": source, "t0_ms": t0_ms,
+        "items": items, "fetched_at": time.time(),
+    }
+
+
 @app.get("/api/inventory")
 async def inventory_snapshot(
-    store_id: str = DEFAULT_STORE_ID, hours: float = 24.0
+    store_id: str = DEFAULT_STORE_ID,
+    refresh: bool = False,
+    background_tasks: BackgroundTasks = None,  # type: ignore[assignment]
 ) -> dict:
-    """Real units sold (sell-through) per leafy-green JPIN over the last `hours`.
+    """Live inventory snapshot per leafy-green JPIN since T0 today (05:00 IST).
 
-    Sales = OUTWARDED movements counted over the window (active leftQty doesn't
-    reflect sales). `source`: "live" (real), "stub" (live disabled), or "error".
-    `sold` is null for JPINs whose OUTWARDED query timed out (high-volume sellers).
+    Returns immediately from cache (source: live/partial/error) or with
+    source: "loading" on the first call. The actual Bolt fetch runs in the
+    background (up to 120s) — the frontend polls until source changes.
+    Pass ?refresh=true to force a new background fetch even when the cache
+    is fresh.
     """
     store = get_store(store_id)
     cands = discover_candidates(store_id, 1000)
     titles = {c.jpin: c.product_title for c in cands}
     jpins = list(titles)
     facility_id = (store or {}).get("facility_id")
+    t0_ms = inventory.t0_today_ms()
 
-    source, snap = "stub", {}
-    if inventory.live_enabled() and facility_id:
-        try:
-            snap = await inventory.live_sold_snapshot(jpins, facility_id, hours)
-            source = "live"
-        except Exception:  # noqa: BLE001
-            source = "error"
+    cached = _inv_cache.get(store_id)
+    is_fetching = store_id in _inv_fetching
+    cache_stale = not cached or (time.time() - cached.get("fetched_at", 0)) > _CACHE_TTL
 
-    items = [
-        {
-            "jpin": j,
-            "product_title": titles[j],
-            "sold": (snap.get(j) or {}).get("sold"),
-            "hours": hours,
+    # Kick off a background fetch when: no cache yet, cache is stale, or forced.
+    if inventory.live_enabled() and facility_id and not is_fetching:
+        if cache_stale or refresh:
+            background_tasks.add_task(
+                _fetch_inventory_bg, store_id, facility_id, jpins, titles
+            )
+            is_fetching = True
+
+    if cached:
+        return {
+            **cached,
+            "store": store,
+            "facility_id": facility_id,
+            "loading": is_fetching,
         }
+
+    # First-ever load — nothing cached yet, fetch just kicked off.
+    empty_items = [
+        {"jpin": j, "product_title": titles[j],
+         "inventory_at_t0": None, "received_today": None, "sold_today": None,
+         "t0_ms": t0_ms}
         for j in jpins
     ]
-    return {"store": store, "facility_id": facility_id, "source": source,
-            "hours": hours, "items": items}
+    return {
+        "store": store, "facility_id": facility_id,
+        "source": "loading" if is_fetching else "error",
+        "t0_ms": t0_ms, "items": empty_items, "loading": is_fetching,
+    }
 
 
 @app.post("/api/runs/seed")
@@ -209,6 +278,17 @@ async def grn(run_id: str, body: AdditionalGrn) -> dict:
 async def soldout(run_id: str) -> dict:
     await _signal(run_id, "sold_out")
     return {"ok": True}
+
+
+@app.post("/api/runs/{run_id}/standing-rule")
+async def set_standing_rule(run_id: str, body: StandingRuleRequest) -> dict:
+    await _signal(run_id, "set_standing_rule", body)
+    return {"ok": True}
+
+
+@app.get("/api/stores/{store_id}/offers")
+async def list_store_offers(store_id: str) -> list[dict]:
+    return repo.list_outcomes_for_store(store_id)
 
 
 async def _signal(run_id: str, name: str, *args) -> None:

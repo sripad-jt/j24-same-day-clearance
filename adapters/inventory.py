@@ -34,7 +34,7 @@ def live_enabled() -> bool:
 
 
 async def live_listing_price(
-    jpin: str, facility_id: str, timeout: float = 20.0
+    jpin: str, facility_id: str, timeout: float = 100.0
 ) -> float | None:
     """Real `listingSellingPrice` for a JPIN (the live markdown anchor).
 
@@ -59,7 +59,7 @@ async def live_listing_price(
 
 
 async def live_units_sold(
-    jpin: str, facility_id: str, since_ms: int, timeout: float = 30.0
+    jpin: str, facility_id: str, since_ms: int, timeout: float = 100.0
 ) -> int | None:
     """Real units sold since `since_ms` (epoch ms) = sell-through over the window.
 
@@ -80,24 +80,123 @@ async def live_units_sold(
     return int(data.get(jpin) or 0)
 
 
-async def live_sold_snapshot(
-    jpins: list[str], facility_id: str, hours: float, timeout: float = 30.0
-) -> dict[str, dict]:
-    """Real units sold per JPIN over the last `hours` — fanned out per JPIN.
+async def live_q0_from_lots(
+    jpin: str, facility_id: str, t0_today_ms: int, timeout: float = 100.0
+) -> int | None:
+    """Sum of initialQty for today's inwarded lots — the live Q0 source (§5.1).
 
-    Returns {jpin: {"sold": int|None, "hours": hours}} ("sold" is None when that
-    JPIN's OUTWARDED query timed out). `since_ms` is computed from the real clock
-    (fine — this runs in an activity / the API, never the workflow).
+    Filters active-state rows by inventoryItemCreatedTime >= t0_today_ms and sums
+    initialQty across matching rows. Returns None on timeout/error or when no
+    matching rows are found (so callers fall back to the synthetic Q0).
+
+    Response shape: each element is {inventoryItem: {jpin, initialQty, leftQty, ...},
+    listingSellingPrice, inventoryItemCreatedTime} — initialQty is nested.
     """
-    since_ms = int((time.time() - hours * 3600) * 1000)
-    results = await asyncio.gather(
-        *(live_units_sold(j, facility_id, since_ms, timeout) for j in jpins),
+    try:
+        rows = await _bolt.details(
+            [jpin], facility_id, _bolt.ACTIVE_STATES, _bolt.ACTIVE_STATUSES,
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("live_q0_from_lots(%s) failed: %s", jpin, e)
+        return None
+    total = sum(
+        int((r.get("inventoryItem") or {}).get("initialQty") or 0)
+        for r in rows
+        if int(r.get("inventoryItemCreatedTime") or 0) >= t0_today_ms
+    )
+    return total if total > 0 else None
+
+
+def t0_today_ms() -> int:
+    """Epoch-ms for today's T0 = 05:00 IST = 23:30 UTC of the previous calendar day.
+
+    Leafy greens arrive at the store from ~05:00 IST; any sales before that belong
+    to the prior day's lot. If the current UTC time is before 23:30 UTC (i.e. before
+    05:00 IST next day), we use today's 23:30 UTC — which is in the future, so we
+    subtract one day to get the most recent 05:00 IST boundary.
+    """
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    # 05:00 IST = 23:30 UTC previous calendar day
+    t0 = now.replace(hour=23, minute=30, second=0, microsecond=0)
+    if t0 > now:
+        t0 -= datetime.timedelta(days=1)
+    return int(t0.timestamp() * 1000)
+
+
+async def live_active_batch(
+    jpins: list[str], facility_id: str, t0_ms: int, timeout: float = 22.0
+) -> dict[str, dict]:
+    """Batched ACTIVE-state details → on_hand + received_today per JPIN.
+
+    Single Bolt call for all JPINs. Returns:
+      {jpin: {"on_hand": int|None, "received_today": int|None}}
+    - on_hand        = sum of leftQty across all active rows
+    - received_today = sum of initialQty for rows where inventoryItemCreatedTime >= t0_ms
+
+    Response shape: each element is
+      {inventoryItem: {jpin, initialQty, leftQty, ...}, inventoryItemCreatedTime, ...}
+    jpin/initialQty/leftQty are nested under inventoryItem; createdTime is top-level.
+    """
+    try:
+        rows = await _bolt.details(
+            jpins, facility_id, _bolt.ACTIVE_STATES, _bolt.ACTIVE_STATUSES,
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("live_active_batch(%s…) failed: %s", jpins[:2], e)
+        return {j: {"on_hand": None, "received_today": None} for j in jpins}
+
+    on_hand: dict[str, int] = {}
+    received: dict[str, int] = {}
+    for r in rows:
+        item = r.get("inventoryItem") or {}
+        j = item.get("jpin") or ""
+        if j not in jpins:
+            continue
+        on_hand[j] = on_hand.get(j, 0) + int(item.get("leftQty") or 0)
+        if int(r.get("inventoryItemCreatedTime") or 0) >= t0_ms:
+            received[j] = received.get(j, 0) + int(item.get("initialQty") or 0)
+
+    return {
+        j: {
+            "on_hand": on_hand.get(j),
+            "received_today": received.get(j),
+        }
+        for j in jpins
+    }
+
+
+async def live_sold_snapshot(
+    jpins: list[str], facility_id: str, t0_ms: int, timeout: float = 22.0
+) -> dict[str, dict]:
+    """Full day-start snapshot per JPIN — two parallel Bolt calls.
+
+    Returns {jpin: {"on_hand": int|None, "received_today": int|None,
+                     "sold_today": int|None, "inventory_at_t0": int|None}}
+    - inventory_at_t0 = on_hand + sold_today  (reconstructed stock at 05:00 IST)
+    - received_today  = GRN lots inwarded since T0
+    - sold_today      = OUTWARDED units since T0
+    """
+    active_task = live_active_batch(jpins, facility_id, t0_ms, timeout=timeout)
+    sold_results = asyncio.gather(
+        *(live_units_sold(j, facility_id, t0_ms, timeout) for j in jpins),
         return_exceptions=True,
     )
+    active_map, sold_list = await asyncio.gather(active_task, sold_results)
+
     out: dict[str, dict] = {}
-    for j, r in zip(jpins, results):
+    for j, r in zip(jpins, sold_list):
         sold = None if isinstance(r, Exception) else r
-        out[j] = {"sold": sold, "hours": hours}
+        on_hand = active_map[j]["on_hand"]
+        received = active_map[j]["received_today"]
+        at_t0 = (on_hand + sold) if (on_hand is not None and sold is not None) else None
+        out[j] = {
+            "inventory_at_t0": at_t0,
+            "received_today": received,
+            "sold_today": sold,
+        }
     return out
 
 

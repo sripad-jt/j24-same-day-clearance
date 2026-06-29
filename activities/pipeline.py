@@ -1,11 +1,12 @@
-"""Activities — all I/O and non-determinism live here (design §13).
+"""Activities — all I/O and non-determinism live here.
 
-Each delegates to an adapter (stub-backed by synthetic data for the demo).
-The workflow stays a pure orchestrator and calls these by name.
+All live data comes from the Bolt Gateway (Inventory Item Details API).
+There is no synthetic fallback: if the API is unavailable, plan_run returns
+ineligible and fetch_sellthrough raises so Temporal retries per its policy.
 """
 from __future__ import annotations
 
-import os
+import asyncio
 import time
 
 from temporalio import activity
@@ -15,54 +16,22 @@ from db import repo
 from pricing.ladder import default_config
 from shared.models import (
     AuditEvent,
-    Checkpoint,
     ReceiptContext,
     RunPlan,
-    SellThrough,
+    SellThroughV2,
 )
 from shared.stores import get_store
 
-# Nominal start-of-day / close used to lay out the ladder (IST hours).
-T0_HOUR_IST = 8
+T0_HOUR_IST = 8   # nominal start-of-day (IST)
 
 
-# Widest-first OUTWARDED window ladder (hours). We try the widest (most complete)
-# window first and fall back to narrower, cheaper scans if it times out — the
-# OUTWARDED scan is slow for high-volume JPINs. All stay strictly UNDER the
-# gateway's 48h (2-day) hard cap on createdTimeAfter (48h itself risks rejection
-# from clock skew, so the widest rung is 47h).
-_DEFAULT_SELLTHROUGH_WINDOWS_H = (47.0, 36.0, 24.0)
-_MAX_WINDOW_H = 47.0  # hard ceiling: gateway rejects createdTimeAfter older than 48h
-
-# Total wall-clock budget (s) for the live read ladder per checkpoint, split
-# across the windows. Kept under the _READ activity start_to_close in the workflow.
-_LIVE_READ_BUDGET_S = 36.0
-
-
-def _sellthrough_windows_h() -> list[float]:
-    """OUTWARDED window ladder in hours, widest first.
-
-    Override via INVENTORY_SELLTHROUGH_WINDOWS_H (comma-separated, e.g. "47,36,24").
-    Values at/below 0 or above the 47h ceiling (gateway rejects >48h) are dropped.
-    """
-    raw = os.getenv("INVENTORY_SELLTHROUGH_WINDOWS_H")
-    if not raw:
-        return list(_DEFAULT_SELLTHROUGH_WINDOWS_H)
-    out: list[float] = []
-    for tok in raw.split(","):
-        try:
-            h = float(tok.strip())
-        except ValueError:
-            continue
-        if 0 < h <= _MAX_WINDOW_H:
-            out.append(h)
-    out.sort(reverse=True)
-    return out or list(_DEFAULT_SELLTHROUGH_WINDOWS_H)
-
-
-def _since_ms(window_h: float) -> int:
-    """Epoch-ms cutoff `window_h` hours ago (real clock — only called in activities)."""
-    return int((time.time() - window_h * 3600) * 1000)
+def _t0_today_ms(receipt_date: str) -> int:
+    """Epoch-ms for T0 = receipt_date at 08:00 IST (02:30 UTC)."""
+    import datetime
+    dt = datetime.datetime.strptime(receipt_date, "%Y-%m-%d").replace(
+        hour=2, minute=30, tzinfo=datetime.timezone.utc
+    )
+    return int(dt.timestamp() * 1000)
 
 
 @activity.defn
@@ -73,128 +42,129 @@ async def plan_run(
     shadow_mode: bool,
     demo_speed: float,
 ) -> RunPlan:
-    """Stage B + planning: build receipt context and the checkpoint timeline.
-
-    Returns checkpoint offsets in *seconds* (scaled by demo_speed) so the
-    deterministic workflow only ever sleeps and compares numbers.
-    """
+    """Build receipt context from live Bolt data. Ineligible if Bolt unavailable."""
     cfg = default_config(shadow_mode=shadow_mode, demo_speed=max(1.0, demo_speed))
     sku = catalog.get_candidate(jpin)
-    if sku is None:
+
+    def _ineligible(reason: str, q0: int = 0, list_price: float = 0.0) -> RunPlan:
         return RunPlan(
             receipt=ReceiptContext(
                 store_id=store_id, jpin=jpin, receipt_date=receipt_date,
-                product_title=jpin, category="UNKNOWN", is_rte=False,
-                shelf_life_days=1, q0=0, list_price=0.0, mrp=0.0,
+                product_title=sku.product_title if sku else jpin,
+                category=sku.category if sku else "UNKNOWN",
+                is_rte=sku.is_rte if sku else False,
+                shelf_life_days=sku.shelf_life_days if sku else 1,
+                q0=q0, q0_source="none",
+                list_price=list_price, mrp=sku.mrp if sku else 0.0,
                 received_epoch_ms=0,
             ),
-            config=cfg, checkpoints=[], close_offset_s=0.0,
-            eligible=False, skip_reason="JPIN not in catalogue",
+            config=cfg, close_offset_s=0.0,
+            eligible=False, skip_reason=reason,
         )
 
-    # Opening stock (Q0) is synthetic, JPIN-keyed (stable across replays). There is
-    # no trustworthy live Q0 from the Inventory API: active `leftQty` is a stale
-    # 3-year lot pile (doesn't reflect sales), and OUTWARDED gives movements, not an
-    # opening batch. Real sell-through (units sold) IS read live per checkpoint in
-    # fetch_sellthrough via the OUTWARDED count.
-    q0 = 30 + (sum(ord(c) for c in jpin) % 25)  # 30..54
+    if sku is None:
+        return _ineligible("JPIN not in catalogue")
 
-    # List price (the markdown anchor) IS read live: the details API now returns a
-    # real per-JPIN listingSellingPrice (e.g. ₹5–15), so snapshot it at run start.
-    # Falls back to the catalogue placeholder on timeout / disabled / no price.
-    list_price = sku.list_price
-    if inventory.live_enabled():
-        facility_id = (get_store(store_id) or {}).get("facility_id")
-        if facility_id:
-            live_price = await inventory.live_listing_price(jpin, facility_id)
-            if live_price and live_price > 0:
-                list_price = live_price
+    if not inventory.live_enabled():
+        return _ineligible("Bolt Gateway not configured (INVENTORY_SOURCE != live)")
+
+    facility_id = (get_store(store_id) or {}).get("facility_id")
+    if not facility_id:
+        return _ineligible(f"no facility_id for store {store_id}")
+
+    t0_ms = _t0_today_ms(receipt_date)
+
+    # Fetch list price and opening Q0 in parallel
+    live_price, live_q0 = await asyncio.gather(
+        inventory.live_listing_price(jpin, facility_id),
+        inventory.live_q0_from_lots(jpin, facility_id, t0_ms),
+        return_exceptions=True,
+    )
+
+    if isinstance(live_price, Exception) or not live_price or live_price <= 0:
+        return _ineligible(f"Bolt: no listing selling price for {jpin} — {live_price!r}")
+
+    if isinstance(live_q0, Exception) or not live_q0 or live_q0 <= 0:
+        return _ineligible(f"Bolt: no inwarded stock (Q0) for {jpin} today — {live_q0!r}")
 
     receipt = ReceiptContext(
         store_id=store_id, jpin=jpin, receipt_date=receipt_date,
         product_title=sku.product_title, category=sku.category, is_rte=sku.is_rte,
-        shelf_life_days=sku.shelf_life_days, q0=q0,
-        list_price=list_price, mrp=sku.mrp,
+        shelf_life_days=sku.shelf_life_days, q0=live_q0, q0_source="lot_initial_qty",
+        list_price=live_price, mrp=sku.mrp,
         received_epoch_ms=0, expiry_date=receipt_date,
     )
 
-    if list_price <= 0:
-        return RunPlan(receipt=receipt, config=cfg, checkpoints=[],
-                       close_offset_s=0.0, eligible=False,
-                       skip_reason="no listing selling price")
-    if q0 < cfg.min_q0:
-        return RunPlan(receipt=receipt, config=cfg, checkpoints=[],
-                       close_offset_s=0.0, eligible=False,
-                       skip_reason=f"Q0 {q0} below min {cfg.min_q0}")
+    if live_q0 < cfg.min_q0:
+        return RunPlan(receipt=receipt, config=cfg, close_offset_s=0.0,
+                       eligible=False, skip_reason=f"Q0 {live_q0} below min {cfg.min_q0}")
 
-    close_h = cfg.store_close_hour
-    total_h = float(close_h - T0_HOUR_IST)
-    checkpoints: list[Checkpoint] = []
-    for r in cfg.rungs:
-        # Elapsed hours for this rung = whichever trigger comes first.
-        candidates: list[float] = []
-        if r.elapsed_hours is not None:
-            candidates.append(r.elapsed_hours)
-        if r.wallclock_hour_ist is not None:
-            candidates.append(float(r.wallclock_hour_ist - T0_HOUR_IST))
-        elapsed = min(candidates) if candidates else 0.0
-        elapsed = max(0.0, min(elapsed, total_h))
-        checkpoints.append(Checkpoint(
-            rung_index=r.index,
-            label=r.label,
-            sleep_offset_s=elapsed * 3600.0 / cfg.demo_speed,
-            nominal_elapsed_h=elapsed,
-            nominal_remaining_h=max(0.0, total_h - elapsed),
-            ceiling_pct=r.ceiling_pct,
-            token_free=r.token_free,
-            wallclock_hour_ist=int(T0_HOUR_IST + elapsed),
-        ))
-
+    total_h = float(cfg.store_close_hour - T0_HOUR_IST)
     return RunPlan(
-        receipt=receipt, config=cfg, checkpoints=checkpoints,
-        close_offset_s=total_h * 3600.0 / cfg.demo_speed, eligible=True,
+        receipt=receipt, config=cfg,
+        close_offset_s=total_h * 3600.0 / cfg.demo_speed,
+        floor_price=0.0,
+        eligible=True,
     )
 
 
 @activity.defn
 async def fetch_sellthrough(
-    store_id: str, jpin: str, q0: int, nominal_elapsed_h: float, total_h: float,
-    trailing_window_h: float, markdown_pct: float,
-) -> SellThrough:
-    # LIVE: real units sold over the window from the OUTWARDED count (sales = outward
-    # movements; active leftQty doesn't decrement). Best-effort — the OUTWARDED scan
-    # times out for high-volume sellers, so fall back to the synthetic curve with a
-    # low_confidence flag when it does.
-    if inventory.live_enabled():
-        facility_id = (get_store(store_id) or {}).get("facility_id")
-        if facility_id:
-            windows = _sellthrough_windows_h()
-            # Split the read budget across the ladder so all attempts fit within
-            # the _READ activity start_to_close timeout.
-            per_try = max(8.0, _LIVE_READ_BUDGET_S / len(windows))
-            for window_h in windows:
-                sold = await inventory.live_units_sold(
-                    jpin, facility_id, _since_ms(window_h), timeout=per_try
-                )
-                if sold is not None:
-                    rate = sold / max(nominal_elapsed_h, 0.5)  # units / nominal hour
-                    activity.logger.info(
-                        "live sell-through %s @ %s: sold=%s/%gh", jpin, facility_id,
-                        sold, window_h,
-                    )
-                    return SellThrough(
-                        units_sold=sold, run_rate=rate, low_confidence=False
-                    )
-            activity.logger.warning(
-                "live sell-through %s timed out at all windows %s — synthetic fallback",
-                jpin, windows,
-            )
+    store_id: str,
+    jpin: str,
+    fallback_q0: int,
+    t0_ms: int,
+    trailing_window_h: float,
+    current_discount_pct: float = 0.0,
+) -> SellThroughV2:
+    """Fetch today-bounded sell-through from Bolt. Raises on failure (Temporal retries)."""
+    if not inventory.live_enabled():
+        raise RuntimeError("Bolt Gateway not configured — cannot fetch sell-through")
 
-    sold, rate = inventory.sell_through(
-        jpin, q0, nominal_elapsed_h, total_h, trailing_window_h, markdown_pct
+    facility_id = (get_store(store_id) or {}).get("facility_id")
+    if not facility_id:
+        raise RuntimeError(f"no facility_id for store {store_id}")
+
+    now_ms = int(time.time() * 1000)
+    trail_start_ms = max(t0_ms, now_ms - int(trailing_window_h * 3600 * 1000))
+    elapsed_h = max(0.5, (now_ms - t0_ms) / 3_600_000)
+
+    # Fire all three Bolt calls in parallel
+    live_q0, units_today, units_in_window = await asyncio.gather(
+        inventory.live_q0_from_lots(jpin, facility_id, t0_ms),
+        inventory.live_units_sold(jpin, facility_id, t0_ms),
+        inventory.live_units_sold(jpin, facility_id, trail_start_ms),
+        return_exceptions=True,
     )
-    return SellThrough(
-        units_sold=sold, run_rate=rate, low_confidence=inventory.live_enabled()
+
+    if isinstance(units_today, Exception) or units_today is None:
+        raise RuntimeError(
+            f"Bolt: units_sold unavailable for {jpin} — {units_today!r}"
+        )
+
+    q0 = (live_q0 if (not isinstance(live_q0, Exception) and live_q0 and live_q0 > 0)
+          else fallback_q0)
+    q0_source = "lot_initial_qty" if q0 != fallback_q0 else "plan_q0"
+
+    cumulative_rate = units_today / elapsed_h
+    window_h = max(0.01, (now_ms - trail_start_ms) / 3_600_000)
+    if isinstance(units_in_window, Exception) or units_in_window is None:
+        recent_rate = cumulative_rate
+    else:
+        recent_rate = units_in_window / window_h
+
+    activity.logger.info(
+        "sell-through %s: q0=%s(%s) today=%s trail=%s/%gh rate=%.2f/h",
+        jpin, q0, q0_source, units_today, units_in_window, trailing_window_h, recent_rate,
+    )
+    return SellThroughV2(
+        units_sold_today=units_today,
+        recent_rate=round(recent_rate, 3),
+        cumulative_rate=round(cumulative_rate, 3),
+        q0=q0,
+        q0_source=q0_source,
+        window_h=round(trailing_window_h, 2),
+        low_confidence=isinstance(units_in_window, Exception) or units_in_window is None,
     )
 
 
@@ -218,11 +188,11 @@ async def shape_offer_llm(
 @activity.defn
 async def apply_price_goldeneye(
     run_id: str, store_id: str, jpin: str, rung: str,
-    from_price: float, to_price: float,
+    from_price: float, to_price: float, price_seq: int,
 ) -> bool:
     confirmed = goldeneye.apply_price(store_id, jpin, rung, to_price)
     if confirmed:
-        repo.record_price_change(run_id, store_id, jpin, rung, from_price, to_price)
+        repo.record_price_change(run_id, store_id, jpin, rung, from_price, to_price, price_seq)
     return confirmed
 
 

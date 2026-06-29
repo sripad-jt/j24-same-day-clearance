@@ -12,9 +12,13 @@ the determinism boundary is preserved (no network in the workflow).
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 
 import httpx
+
+log = logging.getLogger("bolt")
 
 _PATH = "/api/space/product/details/for-state-status-facility"
 _COUNT_PATH = "/api/space/product/count/for-state-status-facility"
@@ -42,6 +46,42 @@ def _headers() -> dict:
     }
 
 
+def _is_retryable(exc: Exception) -> bool:
+    if isinstance(exc, (httpx.TimeoutException, httpx.NetworkError)):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code >= 500
+    return False
+
+
+async def _post_with_retry(
+    path: str,
+    body: dict,
+    timeout: float,
+    max_attempts: int = 2,
+    backoff_s: float = 2.0,
+) -> dict:
+    """POST with retry on transient failures (timeout / 5xx). Non-retryable errors raise immediately."""
+    base = os.getenv("BOLT_BASE_URL", "https://bolt.jumbotail.com").rstrip("/")
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as cx:
+                r = await cx.post(base + path, json=body, headers=_headers())
+                r.raise_for_status()
+                return r.json()
+        except Exception as exc:  # noqa: BLE001
+            if not _is_retryable(exc):
+                raise
+            last_exc = exc
+            if attempt < max_attempts:
+                wait = backoff_s * attempt
+                log.warning("bolt %s attempt %d/%d failed (%s) — retry in %.1fs",
+                            path, attempt, max_attempts, type(exc).__name__, wait)
+                await asyncio.sleep(wait)
+    raise last_exc  # type: ignore[misc]
+
+
 async def details(
     jpins: list[str],
     facility_id: str,
@@ -49,9 +89,9 @@ async def details(
     statuses: list[str],
     created_after_ms: int | None = None,
     max_results: int | None = None,
-    timeout: float = 45.0,
+    timeout: float = 100.0,
 ) -> list[dict]:
-    """POST the details query; return the `data[]` array (raises on HTTP error)."""
+    """POST the details query; return the `data[]` array (raises on non-retryable error)."""
     body: dict = {
         "jpins": jpins,
         "facilityId": facility_id,
@@ -63,11 +103,7 @@ async def details(
     if max_results is not None:
         body["maxResults"] = max_results
 
-    base = os.getenv("BOLT_BASE_URL", "https://bolt.jumbotail.com").rstrip("/")
-    async with httpx.AsyncClient(timeout=timeout) as cx:
-        r = await cx.post(base + _PATH, json=body, headers=_headers())
-        r.raise_for_status()
-        return r.json().get("data") or []
+    return (await _post_with_retry(_PATH, body, timeout)).get("data") or []
 
 
 async def counts(
@@ -76,7 +112,7 @@ async def counts(
     states: list[str],
     statuses: list[str],
     created_after_ms: int | None = None,
-    timeout: float = 50.0,
+    timeout: float = 100.0,
 ) -> dict[str, int]:
     """Lightweight per-JPIN quantity counts (`{jpin: qty}`).
 
@@ -93,8 +129,4 @@ async def counts(
     if created_after_ms is not None:
         body["createdTimeAfter"] = created_after_ms
 
-    base = os.getenv("BOLT_BASE_URL", "https://bolt.jumbotail.com").rstrip("/")
-    async with httpx.AsyncClient(timeout=timeout) as cx:
-        r = await cx.post(base + _COUNT_PATH, json=body, headers=_headers())
-        r.raise_for_status()
-        return r.json().get("data") or {}
+    return (await _post_with_retry(_COUNT_PATH, body, timeout)).get("data") or {}

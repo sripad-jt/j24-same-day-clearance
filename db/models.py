@@ -55,6 +55,13 @@ class MarkdownRun(Base):
     awaiting_approval: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
     shadow_mode: Mapped[bool] = mapped_column(Boolean, default=False)
     summary: Mapped[str] = mapped_column(Text, default="")
+    # v2 additions
+    q0_source: Mapped[str] = mapped_column(String(32), default="synthetic")
+    low_confidence: Mapped[bool] = mapped_column(Boolean, default=False)
+    clearance_mode: Mapped[str] = mapped_column(String(32), default="CLEAR_SAMEDAY")
+    reorder_action: Mapped[str] = mapped_column(String(32), default="NONE")
+    floor_price: Mapped[float] = mapped_column(Float, default=0.0)
+    standing_rule_pct: Mapped[float] = mapped_column(Float, default=100.0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_now, onupdate=_now
@@ -88,15 +95,16 @@ class DecisionRow(Base):
 
 
 class PriceChangeRow(Base):
-    """Durable ledger of applied prices — idempotent on (run_id, rung)."""
+    """Durable ledger of applied prices — idempotent on (run_id, price_seq)."""
 
     __tablename__ = "price_changes"
-    __table_args__ = (UniqueConstraint("run_id", "rung", name="uq_price_run_rung"),)
+    __table_args__ = (UniqueConstraint("run_id", "price_seq", name="uq_price_run_seq"),)
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(String(160), index=True)
     store_id: Mapped[str] = mapped_column(String(64), index=True)
     jpin: Mapped[str] = mapped_column(String(64), index=True)
-    rung: Mapped[str] = mapped_column(String(8))
+    price_seq: Mapped[int] = mapped_column(Integer)
+    rung: Mapped[str] = mapped_column(String(8), default="")  # display label
     from_price: Mapped[float] = mapped_column(Float, default=0.0)
     to_price: Mapped[float] = mapped_column(Float, default=0.0)
     confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -107,7 +115,7 @@ class AuditEventRow(Base):
     __tablename__ = "audit_events"
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     run_id: Mapped[str] = mapped_column(String(160), index=True)
-    payload: Mapped[str] = mapped_column(Text)  # serialised AuditEvent JSON
+    payload: Mapped[str] = mapped_column(Text)
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
 
 
@@ -120,3 +128,50 @@ class OfferRow(Base):
     price: Mapped[float] = mapped_column(Float, default=0.0)
     channel: Mapped[str] = mapped_column(String(32), default="retail_media")
     ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class OfferBaselineRow(Base):
+    """Snapshot captured at the instant a markdown is applied — the 'before'."""
+
+    __tablename__ = "offer_baselines"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(160), index=True)
+    store_id: Mapped[str] = mapped_column(String(64), index=True)
+    jpin: Mapped[str] = mapped_column(String(64), index=True)
+    product_title: Mapped[str] = mapped_column(String(256), default="")
+    rung: Mapped[str] = mapped_column(String(8), default="")
+    from_price: Mapped[float] = mapped_column(Float, default=0.0)
+    to_price: Mapped[float] = mapped_column(Float, default=0.0)
+    discount_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    ts_ist: Mapped[str] = mapped_column(String(40), default="")
+    units_sold_before: Mapped[int] = mapped_column(Integer, default=0)
+    rate_before: Mapped[float] = mapped_column(Float, default=0.0)
+    units_left_before: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class OfferOutcomeRow(Base):
+    """The 'after' + computed lift — the education card for the Giant."""
+
+    __tablename__ = "offer_outcomes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(160), index=True)
+    store_id: Mapped[str] = mapped_column(String(64), index=True)
+    jpin: Mapped[str] = mapped_column(String(64), index=True)
+    product_title: Mapped[str] = mapped_column(String(256), default="")
+    rung: Mapped[str] = mapped_column(String(8), default="")
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    discount_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    ts_ist: Mapped[str] = mapped_column(String(40), default="")
+    phase: Mapped[str] = mapped_column(String(16), index=True, default="interim")
+    rate_before: Mapped[float] = mapped_column(Float, default=0.0)
+    rate_after: Mapped[float] = mapped_column(Float, default=0.0)
+    lift_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    units_sold_after: Mapped[int] = mapped_column(Integer, default=0)
+    incremental_units: Mapped[float] = mapped_column(Float, default=0.0)
+    units_left: Mapped[int] = mapped_column(Integer, default=0)
+    revenue_recovered: Mapped[float] = mapped_column(Float, default=0.0)
+    waste_avoided_units: Mapped[int] = mapped_column(Integer, default=0)
+    waste_avoided_value: Mapped[float] = mapped_column(Float, default=0.0)
+    headline: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)

@@ -36,20 +36,26 @@ export default function Dashboard() {
       .catch(() => {});
   }, [storeId]);
 
-  // Pull the live inventory snapshot (real on-hand + listing price) per store.
-  useEffect(() => {
-    setInv({});
-    setInvSource("");
+  // Pull inventory snapshot — returns immediately from cache, polls while loading.
+  const fetchInventory = (sid: string, refresh = false) => {
+    if (!refresh) { setInv({}); setInvSource(""); }
     setInvLoading(true);
     api
-      .getInventory(storeId)
+      .getInventory(sid, refresh)
       .then((r) => {
         setInv(Object.fromEntries(r.items.map((i) => [i.jpin, i])));
         setInvSource(r.source);
+        if (r.loading) {
+          // Background fetch in progress — poll every 5s until it settles.
+          setTimeout(() => fetchInventory(sid, false), 5000);
+        } else {
+          setInvLoading(false);
+        }
       })
-      .catch(() => setInvSource("error"))
-      .finally(() => setInvLoading(false));
-  }, [storeId]);
+      .catch(() => { setInvSource("error"); setInvLoading(false); });
+  };
+
+  useEffect(() => { fetchInventory(storeId); }, [storeId]);
 
   const visibleStores = useMemo(() => {
     const q = storeFilter.trim().toLowerCase();
@@ -131,13 +137,37 @@ export default function Dashboard() {
 
         <div className="row spread" style={{ marginTop: 12, alignItems: "center" }}>
           <h4 style={{ margin: 0 }}>Leafy greens</h4>
-          <span className="muted">
+          <span className="muted" style={{ display: "flex", alignItems: "center", gap: 6 }}>
             sell-through source:{" "}
-            <span className={`chip ${invSource === "live" ? "s-OBSERVING" : ""}`}>
+            <span className={`chip ${invSource === "live" ? "s-OBSERVING" : invSource === "error" ? "d-HOLD" : invSource === "partial" ? "await" : ""}`}>
               {invLoading ? "loading…" : invSource || "—"}
             </span>
-            {invSource === "live" && " (live OUTWARDED count)"}
+            {invSource === "live" && " (live — as of 5 AM IST)"}
+            {invSource === "partial" && " (some JPINs timed out — shown where available)"}
+            {invSource === "loading" && " (fetching from Bolt, up to 2 min…)"}
             {invSource === "error" && " (API unavailable)"}
+            <button
+              title="Refresh inventory"
+              disabled={invLoading}
+              onClick={() => fetchInventory(storeId, true)}
+              style={{
+                background: "none", border: "none", cursor: invLoading ? "default" : "pointer",
+                padding: "0 2px", opacity: invLoading ? 0.4 : 1, lineHeight: 1,
+                display: "inline-flex", alignItems: "center", color: "inherit",
+              }}
+            >
+              <svg
+                xmlns="http://www.w3.org/2000/svg"
+                width="14" height="14" viewBox="0 0 24 24"
+                fill="none" stroke="currentColor" strokeWidth="2.5"
+                strokeLinecap="round" strokeLinejoin="round"
+                style={{ animation: invLoading ? "spin 1s linear infinite" : "none" }}
+              >
+                <polyline points="23 4 23 10 17 10" />
+                <polyline points="1 20 1 14 7 14" />
+                <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15" />
+              </svg>
+            </button>
           </span>
         </div>
         <table style={{ marginTop: 8 }}>
@@ -148,13 +178,19 @@ export default function Dashboard() {
               </th>
               <th>Leafy green</th>
               <th>JPIN</th>
-              <th>Sold (24h)</th>
+              <th>At 5 AM</th>
+              <th>Received today</th>
+              <th>Sold today</th>
               <th>List price</th>
             </tr>
           </thead>
           <tbody>
             {candidates.map((c) => {
-              const sold = inv[c.jpin]?.sold;
+              const item = inv[c.jpin];
+              const dash = (title?: string) =>
+                invLoading ? "…" : <span className="muted" title={title}>—</span>;
+              const num = (v: number | null | undefined, title?: string) =>
+                v != null ? v.toLocaleString() : dash(title);
               return (
                 <tr key={c.jpin}>
                   <td>
@@ -166,16 +202,14 @@ export default function Dashboard() {
                   </td>
                   <td>{c.product_title}</td>
                   <td className="muted">{c.jpin}</td>
-                  <td>
-                    {sold != null ? (
-                      sold.toLocaleString()
-                    ) : invLoading ? (
-                      "…"
-                    ) : (
-                      <span className="muted" title="OUTWARDED query timed out (high-volume SKU)">
-                        —
-                      </span>
-                    )}
+                  <td title="Total units on hand at 05:00 IST (on_hand now + sold today)">
+                    {num(item?.inventory_at_t0, "Active + OUTWARDED query incomplete")}
+                  </td>
+                  <td title="GRN lots inwarded since 05:00 IST">
+                    {num(item?.received_today, "Active stock query timed out")}
+                  </td>
+                  <td title="OUTWARDED units since 05:00 IST">
+                    {num(item?.sold_today, "OUTWARDED query timed out")}
                   </td>
                   <td title="placeholder — API listingSellingPrice is ₹1">
                     {fmt(c.list_price)}<span className="muted"> *</span>

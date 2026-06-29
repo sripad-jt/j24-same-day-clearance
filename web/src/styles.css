@@ -157,3 +157,5 @@ th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spa
 .timeline li { padding: 5px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
 
 @media (max-width: 720px) { .grid2 { grid-template-columns: 1fr; } }
+
+@keyframes spin { to { transform: rotate(360deg); } }

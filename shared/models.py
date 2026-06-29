@@ -38,81 +38,100 @@ class RunStatus(str, Enum):
     STOPPED = "STOPPED"
 
 
+class ClearanceMode(str, Enum):
+    HOLD = "HOLD"
+    NUDGE = "NUDGE"
+    CLEAR_MULTIDAY = "CLEAR_MULTIDAY"
+    CLEAR_SAMEDAY = "CLEAR_SAMEDAY"
+    SUPPRESS_REORDER = "SUPPRESS_REORDER"
+
+
+class ReorderAction(str, Enum):
+    NONE = "NONE"
+    REDUCE_OTB = "REDUCE_OTB"
+    STOP_REORDER = "STOP_REORDER"
+
+
 # --------------------------------------------------------------------------- #
-# Configuration (snapshotted into workflow state at run start — §8 of design)
+# Configuration (snapshotted into workflow state at run start)
 # --------------------------------------------------------------------------- #
 class RungDef(BaseModel):
-    """One step on the markdown ladder."""
+    """One step on the markdown ladder — kept as display labels and backstops."""
 
-    index: int                       # 0..N, monotonic
-    label: str                       # R0, R1, R2, R3
-    elapsed_hours: Optional[float]   # trigger: hours after T0 (None for R0)
-    wallclock_hour_ist: Optional[int]  # trigger: IST hour (whichever comes first)
-    ceiling_pct: float               # max markdown at this rung (0, 25, 50)
-    token_free: bool = False         # R3 -> token ₹1
+    index: int
+    label: str
+    elapsed_hours: Optional[float]
+    wallclock_hour_ist: Optional[int]
+    ceiling_pct: float
+    token_free: bool = False
 
 
 class MarkdownConfig(BaseModel):
     rungs: list[RungDef]
-    theta_hold: float = 0.85
+    # sell-through
     trailing_window_hours: float = 1.5
-    min_q0: int = 5                  # below this, do not run
-    giveaway_alert_qty: int = 50     # alert if more than this given away in a day
+    min_q0: int = 5
+    giveaway_alert_qty: int = 50
+    # approval
     approval_timeout_minutes: int = 30
+    # store timing
     rte_autoclear_gate_hour: int = 20   # IST; RTE after this auto-clears to ₹1
     store_close_hour: int = 21          # IST
     token_free_price: float = 1.0
+    # decision engine v2 params
+    elasticity: float = 0.6            # demand lift per unit relative price cut
+    max_discount_pct: float = 60.0     # policy cap before the token rung
+    step_pct: float = 5.0              # discount granularity off list
+    hysteresis_units: float = 1.0      # don't step for residual smaller than this
+    residual_tolerance: float = 0.0    # acceptable end-of-day leftover
+    # continuous loop
+    poll_interval_min: float = 30.0    # how often to evaluate per nominal hour
+    measure_window_h: float = 1.5      # how long after offer to measure lift
+    # misc
     enable_llm: bool = False
     shadow_mode: bool = False
-    # Demo: compress nominal hours into seconds. 1.0 = real time.
-    # demo_speed=3600 -> 1 nominal hour elapses in 1 second.
     demo_speed: float = 1.0
 
 
 # --------------------------------------------------------------------------- #
-# Run inputs / data acquisition (§4 of design)
+# Run inputs / data acquisition
 # --------------------------------------------------------------------------- #
 class ReceiptContext(BaseModel):
     """Stage B output — per-batch facts from the Inventory Item Details API."""
 
     store_id: str
     jpin: str
-    receipt_date: str               # ISO date
+    receipt_date: str
     product_title: str
     category: str
     is_rte: bool
-    shelf_life_days: int            # L
-    q0: int                         # opening stock at T0
-    list_price: float               # listing selling price
+    shelf_life_days: int
+    q0: int
+    q0_source: str = "synthetic"       # lot_initial_qty | synthetic
+    list_price: float
     mrp: float
-    received_epoch_ms: int          # inventoryItemCreatedTime
+    received_epoch_ms: int
     mfg_date: Optional[str] = None
     expiry_date: Optional[str] = None
 
 
-class SellThrough(BaseModel):
-    """fetch_sellthrough output — derived from active + OUTWARDED states / POS."""
+class SellThroughV2(BaseModel):
+    """fetch_sellthrough output — today-bounded units + trailing rate.
 
-    units_sold: int
-    run_rate: float                 # units / nominal hour
-    low_confidence: bool = False    # POS stale -> fell back to all-day average
-
-
-class Checkpoint(BaseModel):
-    """A ladder checkpoint, pre-planned by the plan_run activity.
-
-    Timing is expressed as an offset in *seconds* from run start (already scaled
-    by demo_speed). The decision engine uses the nominal hours, never the seconds.
+    Key differences from the old SellThrough:
+      - units_sold_today is OUTWARDED since T0 today (not a 24-47h lookback)
+      - recent_rate is the trailing window rate (reacts to markdown lift)
+      - q0 is read live from initialQty of today's lots (not synthetic)
+      - q0_source records the confidence level
     """
 
-    rung_index: int
-    label: str
-    sleep_offset_s: float           # seconds from run start to this checkpoint
-    nominal_elapsed_h: float        # hours since T0 (for the engine)
-    nominal_remaining_h: float      # hours to must-clear (for the engine)
-    ceiling_pct: float
-    token_free: bool
-    wallclock_hour_ist: int         # the IST hour this checkpoint represents
+    units_sold_today: int
+    recent_rate: float                 # units/hour, trailing window
+    cumulative_rate: float = 0.0       # display only; never feeds the projection
+    q0: int = 0
+    q0_source: str = "synthetic"       # lot_initial_qty | synthetic
+    window_h: float = 0.0
+    low_confidence: bool = False
 
 
 class RunPlan(BaseModel):
@@ -120,28 +139,56 @@ class RunPlan(BaseModel):
 
     receipt: ReceiptContext
     config: MarkdownConfig
-    checkpoints: list[Checkpoint]
-    close_offset_s: float           # seconds from start to store close
-    eligible: bool                  # False if q0 < min_q0 or list_price missing
+    close_offset_s: float              # seconds from run start to store close
+    floor_price: float = 0.0          # cost / salvage clamp per JPIN
+    eligible: bool
     skip_reason: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #
-# Decision engine output (pure, §8)
+# Decision engine output (pure)
 # --------------------------------------------------------------------------- #
-class DecisionResult(BaseModel):
-    target_rung_index: int
+class PriceDecisionV2(BaseModel):
+    """Output of decide_v2() — a price, not a rung index.
+
+    Demand-gated: driven by the projected end-of-day residual and an elasticity
+    estimate, clamped to a price floor. Rungs are display labels only.
+    """
+
     decision: Decision
-    reason: str
-    ratio: float
-    projected_clearance: float
-    residual: float
     target_price: float
+    discount_pct: float                # off list, for the offer headline
+    reason: str
+    residual_at_current: float         # units left over if we don't step
+    residual_at_target: float          # units left over at the chosen price
+    projected_clearance_at_target: float
+    ratio: float                       # proj_at_current / q0
+    clears: bool                       # target projected to clear by close?
+    floored: bool                      # did we hit the price floor without clearing?
     requires_approval: bool
 
 
 # --------------------------------------------------------------------------- #
-# Workflow state (exposed via the current_state query — §6)
+# Shelf-life scheduler output (pure)
+# --------------------------------------------------------------------------- #
+class ShelfLifePlan(BaseModel):
+    """Output of plan_clearance() — runs once/day per multi-day batch.
+
+    For L=1 lines this collapses to CLEAR_SAMEDAY on the receipt date.
+    """
+
+    mode: ClearanceMode
+    recommended_discount_pct: float
+    is_terminal_day: bool
+    projected_days_to_clear: float
+    days_to_expiry: int
+    clearance_window_days: int
+    reorder_action: ReorderAction
+    reason: str
+
+
+# --------------------------------------------------------------------------- #
+# Workflow state (exposed via the current_state query)
 # --------------------------------------------------------------------------- #
 class HistoryEntry(BaseModel):
     ts_ist: str
@@ -152,7 +199,7 @@ class HistoryEntry(BaseModel):
     decision: Decision
     approval: Approval
     reason: str
-    source: str = "checkpoint"      # checkpoint | override | grn | soldout
+    source: str = "poll"               # poll | override | grn | soldout
 
 
 class MarkdownState(BaseModel):
@@ -167,15 +214,23 @@ class MarkdownState(BaseModel):
     # pricing
     list_price: float
     mrp: float
-    current_rung: str
+    current_rung: str                  # display label (R0-R3)
     current_price: float
+    floor_price: float = 0.0
     # sell-through
     q0: int
+    q0_source: str = "synthetic"
     units_sold: int = 0
-    run_rate: float = 0.0
+    recent_rate: float = 0.0           # trailing units/hour
     projected_clearance: float = 0.0
     residual: float = 0.0
     ratio: float = 0.0
+    # decision v2 diagnostics
+    clears: bool = True
+    floored: bool = False
+    # clearance mode (from shelf-life scheduler)
+    clearance_mode: str = "CLEAR_SAMEDAY"
+    reorder_action: str = "NONE"
     # control
     status: RunStatus = RunStatus.STARTED
     awaiting_approval: bool = False
@@ -183,12 +238,13 @@ class MarkdownState(BaseModel):
     pending_rung: Optional[str] = None
     pending_price: Optional[float] = None
     low_confidence: bool = False
+    standing_rule_pct: float = 100.0   # auto-approve ceiling for the day
     last_reason: str = ""
     history: list[HistoryEntry] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
-# Audit (immutable record — §10)
+# Audit (immutable record)
 # --------------------------------------------------------------------------- #
 class AuditEvent(BaseModel):
     run_id: str
@@ -201,13 +257,59 @@ class AuditEvent(BaseModel):
     to_price: float
     q0: int
     units_sold: int
-    run_rate: float
+    recent_rate: float
     projected_clearance: float
     residual: float
     ratio: float
+    clears: bool
+    floored: bool
     decision: Decision
     approval: Approval
     reason: str
+
+
+# --------------------------------------------------------------------------- #
+# Owner-education feed (pre/post sell-through of an offer)
+# --------------------------------------------------------------------------- #
+class OfferBaseline(BaseModel):
+    """Snapshot captured at the instant a markdown is applied — the 'before'."""
+
+    run_id: str
+    store_id: str
+    jpin: str
+    product_title: str
+    rung: str
+    from_price: float
+    to_price: float
+    discount_pct: float
+    ts_ist: str
+    units_sold_before: int
+    rate_before: float
+    units_left_before: int
+
+
+class OfferOutcome(BaseModel):
+    """The 'after' + computed lift, pushed to the Giant as an education card."""
+
+    run_id: str
+    store_id: str
+    jpin: str
+    product_title: str
+    rung: str
+    price: float
+    discount_pct: float
+    ts_ist: str
+    phase: str                         # "interim" | "final"
+    rate_before: float
+    rate_after: float
+    lift_pct: float
+    units_sold_after: int
+    incremental_units: float
+    units_left: int
+    revenue_recovered: float
+    waste_avoided_units: int
+    waste_avoided_value: float
+    headline: str
 
 
 # --------------------------------------------------------------------------- #
@@ -225,20 +327,20 @@ class AdditionalGrn(BaseModel):
 
 
 class ManualOverride(BaseModel):
-    action: str                     # "force_rung" | "stop"
+    action: str                        # "force_rung" | "stop"
     rung: Optional[str] = None
 
 
-class SeedRequest(BaseModel):
-    """API helper to start markdown runs for a store.
+class StandingRuleRequest(BaseModel):
+    auto_approve_max_discount_pct: float
 
-    If `jpins` is given, start exactly those (the UI multi-select). Otherwise fall
-    back to the first `count` catalogue candidates (legacy demo seeding).
-    """
+
+class SeedRequest(BaseModel):
+    """API helper to start markdown runs for a store."""
 
     count: int = 3
-    store_id: str = "BZID-1304298141"   # J24 - Essentials BTM Layout
+    store_id: str = "BZID-1304298141"
     shadow_mode: bool = False
-    demo_speed: float = 1800.0      # 1 nominal hour -> 2 seconds
+    demo_speed: float = 1800.0
     include_rte: bool = True
     jpins: Optional[list[str]] = None

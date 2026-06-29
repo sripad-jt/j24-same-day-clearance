@@ -19,15 +19,18 @@ export interface Candidate {
 export interface InventoryItem {
   jpin: string;
   product_title: string;
-  sold: number | null;
-  hours: number;
+  inventory_at_t0: number | null;
+  received_today: number | null;
+  sold_today: number | null;
+  t0_ms: number;
 }
 
 export interface InventorySnapshot {
   store: Store | null;
   facility_id: string | null;
-  source: "live" | "stub" | "error";
-  hours: number;
+  source: "live" | "partial" | "error" | "loading";
+  t0_ms: number;
+  loading: boolean;
   items: InventoryItem[];
 }
 
@@ -73,6 +76,7 @@ export interface RunEvent {
 
 export interface PriceChange {
   rung: string;
+  price_seq: number;
   from_price: number;
   to_price: number;
   confirmed: boolean;
@@ -90,17 +94,44 @@ export interface Offer {
 export interface LiveState {
   current_rung: string;
   current_price: number;
+  list_price: number;
+  floor_price: number;
   q0: number;
+  q0_source: string;
   units_sold: number;
-  run_rate: number;
+  recent_rate: number;
   projected_clearance: number;
   residual: number;
   ratio: number;
+  clears: boolean;
+  floored: boolean;
+  clearance_mode: string;
+  reorder_action: string;
+  standing_rule_pct: number;
+  low_confidence: boolean;
   status: string;
   awaiting_approval: boolean;
   pending_rung: string | null;
   pending_price: number | null;
   last_reason: string;
+}
+
+export interface OfferOutcome {
+  run_id: string;
+  jpin: string;
+  product_title: string;
+  phase: string;
+  discount_pct: number;
+  rate_before: number;
+  rate_after: number;
+  lift_pct: number;
+  units_sold_after: number;
+  units_left: number;
+  revenue_recovered: number;
+  waste_avoided_units: number;
+  waste_avoided_value: number;
+  headline: string;
+  ts_ist: string;
 }
 
 export interface RunDetail extends RunSummary {

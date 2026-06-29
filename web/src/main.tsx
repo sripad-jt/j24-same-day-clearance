@@ -6,6 +6,7 @@ import Dashboard from "./pages/Dashboard";
 import RunDetail from "./pages/RunDetail";
 import Approval from "./pages/Approval";
 import Config from "./pages/Config";
+import MyOffers from "./pages/MyOffers";
 import "./styles.css";
 
 const router = createBrowserRouter(
@@ -18,6 +19,7 @@ const router = createBrowserRouter(
         { path: "approvals", element: <Approval /> },
         { path: "config", element: <Config /> },
         { path: "runs/:id", element: <RunDetail /> },
+        { path: "offers", element: <MyOffers /> },
       ],
     },
   ],

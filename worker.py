@@ -7,6 +7,7 @@ import logging
 
 from temporalio.worker import Worker
 
+from activities.feeds import capture_offer_baseline, measure_offer_outcome
 from activities.persistence import persist_decision, persist_state, record_run_event
 from activities.pipeline import (
     apply_price_goldeneye,
@@ -45,6 +46,8 @@ async def main() -> None:
                 persist_state,
                 record_run_event,
                 persist_decision,
+                capture_offer_baseline,
+                measure_offer_outcome,
             ],
             activity_executor=executor,
         )

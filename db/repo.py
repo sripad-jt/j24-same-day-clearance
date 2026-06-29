@@ -1,6 +1,7 @@
 """All DB reads/writes via short-lived sessions. Used by activities and the API."""
 from __future__ import annotations
 
+import json
 from typing import Optional
 
 from sqlalchemy import select
@@ -10,12 +11,14 @@ from db.models import (
     AuditEventRow,
     DecisionRow,
     MarkdownRun,
+    OfferBaselineRow,
+    OfferOutcomeRow,
     OfferRow,
     PriceChangeRow,
     RunEventRow,
     StoreRow,
 )
-from shared.models import AuditEvent, MarkdownState
+from shared.models import AuditEvent, MarkdownState, OfferBaseline, OfferOutcome
 
 
 # --------------------------------------------------------------------------- #
@@ -43,6 +46,13 @@ def upsert_run_from_state(run_id: str, state: MarkdownState) -> None:
         run.awaiting_approval = state.awaiting_approval
         run.shadow_mode = state.shadow_mode
         run.summary = state.last_reason
+        # v2 fields
+        run.q0_source = state.q0_source
+        run.low_confidence = state.low_confidence
+        run.clearance_mode = state.clearance_mode
+        run.reorder_action = state.reorder_action
+        run.floor_price = state.floor_price
+        run.standing_rule_pct = state.standing_rule_pct
 
 
 def list_runs() -> list[dict]:
@@ -89,7 +99,8 @@ def get_run(run_id: str) -> Optional[dict]:
         ]
         d["price_changes"] = [
             {
-                "rung": p.rung, "from_price": p.from_price, "to_price": p.to_price,
+                "rung": p.rung, "price_seq": p.price_seq,
+                "from_price": p.from_price, "to_price": p.to_price,
                 "confirmed": p.confirmed, "ts": p.ts.isoformat(),
             }
             for p in prices
@@ -140,20 +151,22 @@ def add_decision(run_id: str, d: dict) -> None:
 
 def record_price_change(
     run_id: str, store_id: str, jpin: str, rung: str,
-    from_price: float, to_price: float,
+    from_price: float, to_price: float, price_seq: int,
 ) -> bool:
-    """Idempotent on (run_id, rung). Returns True if newly inserted."""
+    """Idempotent on (run_id, price_seq). Returns True if newly inserted."""
     with SessionLocal.begin() as s:
         existing = s.scalars(
             select(PriceChangeRow).where(
-                PriceChangeRow.run_id == run_id, PriceChangeRow.rung == rung
+                PriceChangeRow.run_id == run_id,
+                PriceChangeRow.price_seq == price_seq,
             )
         ).first()
         if existing is not None:
             return False
         s.add(PriceChangeRow(
             run_id=run_id, store_id=store_id, jpin=jpin, rung=rung,
-            from_price=from_price, to_price=to_price, confirmed=True,
+            price_seq=price_seq, from_price=from_price, to_price=to_price,
+            confirmed=True,
         ))
         return True
 
@@ -169,7 +182,6 @@ def list_audit(run_id: str) -> list[dict]:
             select(AuditEventRow).where(AuditEventRow.run_id == run_id)
             .order_by(AuditEventRow.id)
         ).all()
-        import json
         return [json.loads(r.payload) for r in rows]
 
 
@@ -177,6 +189,42 @@ def add_offer(run_id: str, rung: str, headline: str, price: float, channel: str)
     with SessionLocal.begin() as s:
         s.add(OfferRow(run_id=run_id, rung=rung, headline=headline,
                        price=price, channel=channel))
+
+
+# --------------------------------------------------------------------------- #
+# Owner-education feed (offer baselines + outcomes)
+# --------------------------------------------------------------------------- #
+def add_offer_baseline(b: OfferBaseline) -> None:
+    with SessionLocal.begin() as s:
+        s.add(OfferBaselineRow(**b.model_dump()))
+
+
+def add_offer_outcome(o: OfferOutcome) -> None:
+    with SessionLocal.begin() as s:
+        s.add(OfferOutcomeRow(**o.model_dump()))
+
+
+def list_outcomes_for_store(store_id: str) -> list[dict]:
+    """Powers the My J24 'My Offers' pre/post feed for a Giant."""
+    with SessionLocal() as s:
+        rows = s.scalars(
+            select(OfferOutcomeRow)
+            .where(OfferOutcomeRow.store_id == store_id)
+            .order_by(OfferOutcomeRow.id.desc())
+        ).all()
+        return [
+            {
+                "run_id": r.run_id, "jpin": r.jpin, "product_title": r.product_title,
+                "phase": r.phase, "discount_pct": r.discount_pct,
+                "rate_before": r.rate_before, "rate_after": r.rate_after,
+                "lift_pct": r.lift_pct, "units_sold_after": r.units_sold_after,
+                "units_left": r.units_left, "revenue_recovered": r.revenue_recovered,
+                "waste_avoided_units": r.waste_avoided_units,
+                "waste_avoided_value": r.waste_avoided_value,
+                "headline": r.headline, "ts_ist": r.ts_ist,
+            }
+            for r in rows
+        ]
 
 
 # --------------------------------------------------------------------------- #

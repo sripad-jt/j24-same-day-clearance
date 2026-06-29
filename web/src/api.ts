@@ -1,6 +1,7 @@
 import type {
   Candidate,
   InventorySnapshot,
+  OfferOutcome,
   RunDetail,
   RunSummary,
   Store,
@@ -31,8 +32,8 @@ export const api = {
     fetch(`${API}/candidates?store_id=${encodeURIComponent(storeId)}`).then((r) =>
       j<{ store: Store | null; candidates: Candidate[] }>(r)
     ),
-  getInventory: (storeId: string) =>
-    fetch(`${API}/inventory?store_id=${encodeURIComponent(storeId)}`).then((r) =>
+  getInventory: (storeId: string, refresh = false) =>
+    fetch(`${API}/inventory?store_id=${encodeURIComponent(storeId)}${refresh ? "&refresh=true" : ""}`).then((r) =>
       j<InventorySnapshot>(r)
     ),
   seed: (body: {
@@ -50,6 +51,14 @@ export const api = {
   grn: (id: string, qty: number) =>
     post(`/runs/${encodeURIComponent(id)}/grn`, { qty }),
   soldOut: (id: string) => post(`/runs/${encodeURIComponent(id)}/soldout`),
+  setStandingRule: (id: string, pct: number) =>
+    post(`/runs/${encodeURIComponent(id)}/standing-rule`, {
+      auto_approve_max_discount_pct: pct,
+    }),
+  listStoreOffers: (storeId: string) =>
+    fetch(`${API}/stores/${encodeURIComponent(storeId)}/offers`).then((r) =>
+      j<OfferOutcome[]>(r)
+    ),
 };
 
 export function poll<T>(fn: () => Promise<T>, ms: number, cb: (v: T) => void) {

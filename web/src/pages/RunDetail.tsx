@@ -15,18 +15,32 @@ const RUNG_LABEL: Record<string, string> = {
 export default function RunDetail() {
   const { id = "" } = useParams();
   const [run, setRun] = useState<Detail | null>(null);
+  const [standingPct, setStandingPct] = useState("");
+  const [standingMsg, setStandingMsg] = useState("");
 
   useEffect(() => poll(() => api.getRun(id), 1500, setRun), [id]);
 
   if (!run) return <div className="card">Loading…</div>;
   const live = run.live;
-  const rate = live?.run_rate ?? 0;
+  const rate = live?.recent_rate ?? 0;
   const ratio = live?.ratio ?? 0;
   const proj = live?.projected_clearance ?? 0;
   const residual = live?.residual ?? 0;
 
   const decide = (approve: boolean) =>
     api.decide(id, approve, run.current_rung).then(() => api.getRun(id).then(setRun));
+
+  const applyStandingRule = () => {
+    const pct = parseFloat(standingPct);
+    if (isNaN(pct) || pct < 0 || pct > 100) {
+      setStandingMsg("Enter a discount % between 0 and 100.");
+      return;
+    }
+    api.setStandingRule(id, pct).then(() => {
+      setStandingMsg(`Auto-approve ceiling set to ${pct}% off.`);
+      setStandingPct("");
+    });
+  };
 
   return (
     <div>
@@ -62,11 +76,29 @@ export default function RunDetail() {
 
         <div className="stats">
           <Stat label="Current price" value={fmt(run.current_price)} sub={`list ${fmt(run.list_price)}`} />
-          <Stat label="Sold / Q0" value={`${run.units_sold} / ${run.q0}`} />
-          <Stat label="Run rate" value={`${rate.toFixed(1)}/h`} />
+          <Stat label="Sold / Q0" value={`${run.units_sold} / ${run.q0}`} sub={live?.q0_source} />
+          <Stat label="Recent rate" value={`${rate.toFixed(1)}/h`} sub={live?.low_confidence ? "⚠ low conf" : undefined} />
           <Stat label="Projected" value={proj.toFixed(0)} sub={`ratio ${ratio.toFixed(2)}`} />
           <Stat label="Residual" value={residual.toFixed(0)} />
         </div>
+
+        {live && (
+          <div className="stats" style={{ marginTop: 4 }}>
+            <Stat
+              label="Clearance mode"
+              value={live.clearance_mode || "—"}
+              sub={live.reorder_action !== "NONE" ? live.reorder_action : undefined}
+            />
+            <Stat label="Clears?" value={live.clears ? "✓ yes" : "✗ no"} sub={live.floored ? "floor hit" : undefined} />
+            {live.floor_price > 0 && (
+              <Stat label="Floor price" value={fmt(live.floor_price)} />
+            )}
+            {live.standing_rule_pct > 0 && (
+              <Stat label="Auto-approve ≤" value={`${live.standing_rule_pct}% off`} />
+            )}
+          </div>
+        )}
+
         <p className="reason">{live?.last_reason || run.summary}</p>
       </div>
 
@@ -97,6 +129,21 @@ export default function RunDetail() {
           <button onClick={() => api.override(id, "stop")}>Stop run</button>
           <button onClick={() => api.override(id, "force_rung", "R2")}>Force R2 (50%)</button>
           <button onClick={() => api.grn(id, 10)}>+10 GRN re-receipt</button>
+        </div>
+        <div className="row" style={{ marginTop: 12, alignItems: "center" }}>
+          <label style={{ marginRight: 6 }}>Auto-approve steps up to</label>
+          <input
+            type="number"
+            min={0}
+            max={100}
+            step={5}
+            placeholder="% off"
+            value={standingPct}
+            onChange={(e) => setStandingPct(e.target.value)}
+            style={{ width: 72, marginRight: 6 }}
+          />
+          <button onClick={applyStandingRule}>Set ceiling</button>
+          {standingMsg && <span className="muted" style={{ marginLeft: 8 }}>{standingMsg}</span>}
         </div>
       </div>
 
@@ -136,7 +183,7 @@ export default function RunDetail() {
           {run.price_changes.length === 0 && <p className="muted">No applied prices.</p>}
           {run.price_changes.map((p, i) => (
             <div key={i} className="line">
-              {p.rung}: {fmt(p.from_price)} → <b>{fmt(p.to_price)}</b>{" "}
+              #{p.price_seq} {p.rung}: {fmt(p.from_price)} → <b>{fmt(p.to_price)}</b>{" "}
               {p.confirmed && <span className="tag ok">confirmed</span>}
             </div>
           ))}
