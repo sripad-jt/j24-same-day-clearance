@@ -47,6 +47,7 @@ export const api = {
     count?: number;
     include_rte?: boolean;
     simulate?: boolean;
+    mock?: boolean;
   }) => post<{ started: string[] }>("/runs/seed", body),
   decide: (id: string, approve: boolean, rung: string) =>
     post(`/runs/${encodeURIComponent(id)}/decision`, { rung, approve }),
@@ -82,6 +83,7 @@ export const api = {
     auto_start: boolean;
     demo_speed: number;
     shadow_mode: boolean;
+    mock?: boolean;
   }) => post<{ started: string }>("/deadstock/discover", body),
   deadStockSeed: (body: {
     store_id: string;
@@ -89,6 +91,7 @@ export const api = {
     demo_speed: number;
     shadow_mode: boolean;
     simulate: boolean;
+    mock?: boolean;
   }) => post<{ started: string[] }>("/deadstock/seed", body),
 };
 

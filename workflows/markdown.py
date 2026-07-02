@@ -135,10 +135,11 @@ class PerishableMarkdownWorkflow:
         shadow_mode: bool = False,
         demo_speed: float = 1800.0,
         simulate: bool = False,
+        mock_gateway: bool = False,
     ) -> str:
         plan = await workflow.execute_activity(
             plan_run,
-            args=[store_id, jpin, receipt_date, shadow_mode, demo_speed],
+            args=[store_id, jpin, receipt_date, shadow_mode, demo_speed, mock_gateway],
             **_READ,
         )
         r = plan.receipt
@@ -276,7 +277,7 @@ class PerishableMarkdownWorkflow:
                 st = await workflow.execute_activity(
                     fetch_sellthrough,
                     args=[store_id, jpin, self._state.q0, t0_ms,
-                          cfg.trailing_window_hours, current_pct],
+                          cfg.trailing_window_hours, current_pct, mock_gateway],
                     **_READ,
                 )
             self._state.units_sold = st.units_sold_today

@@ -11,7 +11,7 @@ import time
 
 from temporalio import activity
 
-from adapters import catalog, copy_llm, goldeneye, inventory, notify, retailmedia
+from adapters import _bolt, catalog, copy_llm, goldeneye, inventory, notify, retailmedia
 from db import repo
 from pricing.ladder import default_config
 from shared.models import (
@@ -41,8 +41,11 @@ async def plan_run(
     receipt_date: str,
     shadow_mode: bool,
     demo_speed: float,
+    mock_gateway: bool = False,
 ) -> RunPlan:
     """Build receipt context from live Bolt data. Ineligible if Bolt unavailable."""
+    if mock_gateway:
+        _bolt.use_mock_gateway()
     cfg = default_config(shadow_mode=shadow_mode, demo_speed=max(1.0, demo_speed))
     sku = catalog.get_candidate(jpin)
 
@@ -116,8 +119,11 @@ async def fetch_sellthrough(
     t0_ms: int,
     trailing_window_h: float,
     current_discount_pct: float = 0.0,
+    mock_gateway: bool = False,
 ) -> SellThroughV2:
     """Fetch today-bounded sell-through from Bolt. Raises on failure (Temporal retries)."""
+    if mock_gateway:
+        _bolt.use_mock_gateway()
     if not inventory.live_enabled():
         raise RuntimeError("Bolt Gateway not configured — cannot fetch sell-through")
 

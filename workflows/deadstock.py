@@ -93,6 +93,7 @@ class DeadStockClearanceWorkflow:
         simulate: bool = False,
         auto_apply: bool = True,
         standing_rule_pct: float = 100.0,
+        mock_gateway: bool = False,
         # carried across continue-as-new:
         _price_seq: int = 0,
         _day: int = 0,
@@ -103,7 +104,7 @@ class DeadStockClearanceWorkflow:
 
         plan = await workflow.execute_activity(
             plan_deadstock_run,
-            args=[store_id, jpin, days_unsold, shadow_mode, demo_speed],
+            args=[store_id, jpin, days_unsold, shadow_mode, demo_speed, mock_gateway],
             **_READ,
         )
         run_id = workflow.info().workflow_id
@@ -148,7 +149,7 @@ class DeadStockClearanceWorkflow:
                 self._state.days_since_received += (1 if days_this_run else 0)
             else:
                 stock = await workflow.execute_activity(
-                    read_deadstock_stock, args=[store_id, jpin], **_READ,
+                    read_deadstock_stock, args=[store_id, jpin, mock_gateway], **_READ,
                 )
                 if stock.get("on_hand") is not None:
                     self._state.on_hand = int(stock["on_hand"])
@@ -258,6 +259,7 @@ class DeadStockClearanceWorkflow:
                 workflow.continue_as_new(args=[
                     store_id, jpin, self._state.days_unsold, shadow_mode, demo_speed,
                     self._state.simulate, auto_apply, self._state.standing_rule_pct,
+                    mock_gateway,
                     self._price_seq, self._day, self._state.current_price,
                 ])
 

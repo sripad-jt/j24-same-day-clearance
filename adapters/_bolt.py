@@ -13,12 +13,32 @@ the determinism boundary is preserved (no network in the workflow).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import logging
 import os
 
 import httpx
 
 log = logging.getLogger("bolt")
+
+# Per-run gateway override (set inside a Bolt-facing activity for a "mock" run).
+# A ContextVar is task-local: asyncio copies the context when Temporal starts each
+# activity task, so a mock run and a live run executing concurrently never bleed
+# into each other. None = use the .env-configured live gateway.
+_gw_override: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "bolt_gateway", default=None
+)
+
+
+def use_mock_gateway() -> None:
+    """Point this activity's Bolt calls at the local mock gateway (tools/mock_bolt).
+    Call at the top of a Bolt-facing activity when the run chose the mock source."""
+    _gw_override.set({
+        "base_url": os.getenv("MOCK_BOLT_URL", "http://localhost:9099").rstrip("/"),
+        "auth_token": os.getenv("MOCK_BOLT_TOKEN", "mock"),
+        "user_id": os.getenv("BOLT_USER_ID", "mock"),
+        "org_id": os.getenv("BOLT_ORG_ID", "mock"),
+    })
 
 _PATH = "/api/space/product/details/for-state-status-facility"
 _COUNT_PATH = "/api/space/product/count/for-state-status-facility"
@@ -30,7 +50,10 @@ OUTWARDED_STATUSES = ["ACTIVE", "EXHAUSTED"]
 
 
 def configured() -> bool:
-    """True when the live source is selected and creds are present."""
+    """True when a gateway is usable — either a mock override is set for this run,
+    or the live source is selected with creds present."""
+    if _gw_override.get() is not None:
+        return True
     return (
         os.getenv("INVENTORY_SOURCE", "stub").lower() == "live"
         and bool(os.getenv("BOLT_AUTH_TOKEN"))
@@ -38,6 +61,12 @@ def configured() -> bool:
 
 
 def _headers() -> dict:
+    o = _gw_override.get()
+    if o is not None:
+        return {
+            "userId": o["user_id"], "orgId": o["org_id"],
+            "Authorization": o["auth_token"], "Content-Type": "application/json",
+        }
     return {
         "userId": os.getenv("BOLT_USER_ID", ""),
         "orgId": os.getenv("BOLT_ORG_ID", ""),
@@ -62,7 +91,9 @@ async def _post_with_retry(
     backoff_s: float = 2.0,
 ) -> dict:
     """POST with retry on transient failures (timeout / 5xx). Non-retryable errors raise immediately."""
-    base = os.getenv("BOLT_BASE_URL", "https://bolt.jumbotail.com").rstrip("/")
+    o = _gw_override.get()
+    base = (o["base_url"] if o is not None
+            else os.getenv("BOLT_BASE_URL", "https://bolt.jumbotail.com").rstrip("/"))
     last_exc: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:

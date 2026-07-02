@@ -15,7 +15,7 @@ import time
 
 from temporalio import activity
 
-from adapters import deadstock, inventory, sku_master
+from adapters import _bolt, deadstock, inventory, sku_master
 from db import repo
 from pricing.ladder import default_config
 from shared.models import DeadStockItem, DeadStockPlan, DeadStockState
@@ -44,9 +44,12 @@ async def plan_deadstock_run(
     days_unsold: int,
     shadow_mode: bool,
     demo_speed: float,
+    mock_gateway: bool = False,
 ) -> DeadStockPlan:
     """Snapshot the facts for a dead-stock clearance run. Ineligible when we can't
     price it (no shelf life, no live stock, or no list price)."""
+    if mock_gateway:
+        _bolt.use_mock_gateway()
     cfg = default_config(shadow_mode=shadow_mode, demo_speed=max(1.0, demo_speed))
     sku = sku_master.resolve_sku(jpin)
 
@@ -99,9 +102,11 @@ async def plan_deadstock_run(
 
 
 @activity.defn
-async def read_deadstock_stock(store_id: str, jpin: str) -> dict:
+async def read_deadstock_stock(store_id: str, jpin: str, mock_gateway: bool = False) -> dict:
     """Daily refresh: current on-hand + days-since-received from live Bolt.
     Returns {"on_hand": int|None, "days_since_received": int|None}."""
+    if mock_gateway:
+        _bolt.use_mock_gateway()
     facility_id = (get_store(store_id) or {}).get("facility_id") or ""
     detail = await inventory.live_stock_detail(jpin, facility_id)
     return {

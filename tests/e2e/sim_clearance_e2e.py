@@ -45,7 +45,7 @@ DATE = "2026-07-01"
 
 
 @activity.defn(name="plan_run")
-async def fake_plan_run(store_id, jpin, receipt_date, shadow_mode, demo_speed):
+async def fake_plan_run(store_id, jpin, receipt_date, shadow_mode, demo_speed, mock_gateway=False):
     cfg = default_config(demo_speed=demo_speed, projection_mode="v3")
     receipt = ReceiptContext(
         store_id=store_id, jpin=jpin, receipt_date=receipt_date,

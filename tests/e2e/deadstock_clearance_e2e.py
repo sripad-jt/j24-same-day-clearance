@@ -43,7 +43,7 @@ STORE, JPIN = "BZID-1304298141", "JPIN-DEAD-1"
 
 
 @activity.defn(name="plan_deadstock_run")
-async def fake_plan(store_id, jpin, days_unsold, shadow_mode, demo_speed):
+async def fake_plan(store_id, jpin, days_unsold, shadow_mode, demo_speed, mock_gateway=False):
     cfg = default_config(shadow_mode=shadow_mode, demo_speed=demo_speed)
     return DeadStockPlan(
         store_id=store_id, jpin=jpin, product_title="Paneer 200g (test)",

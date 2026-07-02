@@ -18,7 +18,7 @@ export default function Dashboard() {
   const [invLoading, setInvLoading] = useState(false);
   const [speed, setSpeed] = useState(1800);
   const [shadow, setShadow] = useState(false);
-  const [sim, setSim] = useState(false);
+  const [source, setSource] = useState<"live" | "sim" | "mock">("live");
   const [busy, setBusy] = useState(false);
 
   useEffect(() => poll(api.listRuns, 2000, setRuns), []);
@@ -84,7 +84,8 @@ export default function Dashboard() {
         jpins: [...selected],
         shadow_mode: shadow,
         demo_speed: speed,
-        simulate: sim,
+        simulate: source === "sim",
+        mock: source === "mock",
       });
       setRuns(await api.listRuns());
     } finally {
@@ -135,13 +136,13 @@ export default function Dashboard() {
             />
             Shadow mode (no price writes)
           </label>
-          <label className="checkbox">
-            <input
-              type="checkbox"
-              checked={sim}
-              onChange={(e) => setSim(e.target.checked)}
-            />
-            Simulate (live price, edit sell-through in the run)
+          <label>
+            Data source{" "}
+            <select value={source} onChange={(e) => setSource(e.target.value as any)}>
+              <option value="live">Live (Bolt)</option>
+              <option value="sim">Live price + simulated sales</option>
+              <option value="mock">Mock gateway</option>
+            </select>
           </label>
         </div>
 

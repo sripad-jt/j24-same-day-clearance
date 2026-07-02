@@ -255,7 +255,7 @@ async def seed(req: SeedRequest) -> dict:
         await c.start_workflow(
             PerishableMarkdownWorkflow.run,
             args=[req.store_id, jpin, today, req.shadow_mode, req.demo_speed,
-                  req.simulate],
+                  req.simulate, req.mock],
             id=wid,
             task_queue=TASK_QUEUE,
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
@@ -330,7 +330,7 @@ async def deadstock_discover(req: DeadStockDiscoverRequest) -> dict:
     wid = f"deadstock-discovery-{req.store_id}"
     await c.start_workflow(
         DeadStockDiscoveryWorkflow.run,
-        args=[req.store_id, req.auto_start, req.shadow_mode, req.demo_speed],
+        args=[req.store_id, req.auto_start, req.shadow_mode, req.demo_speed, req.mock],
         id=wid, task_queue=TASK_QUEUE,
         id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
     )
@@ -348,7 +348,7 @@ async def deadstock_seed(req: DeadStockSeedRequest) -> dict:
         await c.start_workflow(
             DeadStockClearanceWorkflow.run,
             args=[req.store_id, jpin, 0, req.shadow_mode, req.demo_speed,
-                  req.simulate, False, 0.0],
+                  req.simulate, False, 0.0, req.mock],
             id=wid, task_queue=TASK_QUEUE,
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
         )

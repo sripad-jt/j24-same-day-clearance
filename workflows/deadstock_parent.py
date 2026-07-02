@@ -48,6 +48,7 @@ class DeadStockDiscoveryWorkflow:
         auto_start: bool = False,
         shadow_mode: bool = False,
         demo_speed: float = 1800.0,
+        mock_gateway: bool = False,
         _day: int = 0,
     ) -> str:
         parent_run_id = f"deadstock-discovery-{store_id}"
@@ -74,7 +75,7 @@ class DeadStockDiscoveryWorkflow:
                     await workflow.start_child_workflow(
                         DeadStockClearanceWorkflow.run,
                         args=[store_id, it.jpin, it.days_unsold, shadow_mode, demo_speed,
-                              False, True, 100.0],
+                              False, True, 100.0, mock_gateway],
                         id=child_id,
                         parent_close_policy=ParentClosePolicy.ABANDON,
                         id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
@@ -101,7 +102,7 @@ class DeadStockDiscoveryWorkflow:
         if self._stop:
             return f"stopped after {len(items)} items"
         workflow.continue_as_new(
-            args=[store_id, auto_start, shadow_mode, demo_speed, _day + 1]
+            args=[store_id, auto_start, shadow_mode, demo_speed, mock_gateway, _day + 1]
         )
 
     @workflow.signal

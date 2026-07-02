@@ -13,7 +13,7 @@ export default function DeadStock() {
   const [runs, setRuns] = useState<DeadStockRunSummary[]>([]);
   const [speed, setSpeed] = useState(1800);
   const [shadow, setShadow] = useState(false);
-  const [sim, setSim] = useState(false);
+  const [source, setSource] = useState<"live" | "sim" | "mock">("live");
   const [autoStart, setAutoStart] = useState(false);
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
@@ -49,6 +49,7 @@ export default function DeadStock() {
         auto_start: autoStart,
         demo_speed: speed,
         shadow_mode: shadow,
+        mock: source === "mock",
       });
       setMsg(
         autoStart
@@ -66,7 +67,8 @@ export default function DeadStock() {
       jpins: [jpin],
       demo_speed: speed,
       shadow_mode: shadow,
-      simulate: sim,
+      simulate: source === "sim",
+      mock: source === "mock",
     });
     setMsg(`Started clearance for ${jpin}.`);
   };
@@ -99,9 +101,13 @@ export default function DeadStock() {
             <input type="checkbox" checked={shadow} onChange={(e) => setShadow(e.target.checked)} />
             Shadow
           </label>
-          <label className="checkbox">
-            <input type="checkbox" checked={sim} onChange={(e) => setSim(e.target.checked)} />
-            Simulate
+          <label>
+            Data source{" "}
+            <select value={source} onChange={(e) => setSource(e.target.value as any)}>
+              <option value="live">Live (Bolt)</option>
+              <option value="sim">Live price + simulated sales</option>
+              <option value="mock">Mock gateway</option>
+            </select>
           </label>
           <label className="checkbox">
             <input type="checkbox" checked={autoStart} onChange={(e) => setAutoStart(e.target.checked)} />

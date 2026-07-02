@@ -351,6 +351,7 @@ class SeedRequest(BaseModel):
     include_rte: bool = True
     jpins: Optional[list[str]] = None
     simulate: bool = False             # start runs in UI-driven sim mode (live price, editable sell-through)
+    mock: bool = False                 # data source = mock gateway (tools/mock_bolt) for this run
 
 
 class SimulateRequest(BaseModel):
@@ -482,6 +483,7 @@ class DeadStockDiscoverRequest(BaseModel):
     auto_start: bool = False            # start clearance runs automatically vs discover-only
     demo_speed: float = 1800.0
     shadow_mode: bool = False
+    mock: bool = False                  # started clearance runs use the mock gateway
 
 
 class DeadStockSeedRequest(BaseModel):
@@ -492,3 +494,4 @@ class DeadStockSeedRequest(BaseModel):
     demo_speed: float = 1800.0
     shadow_mode: bool = False
     simulate: bool = False
+    mock: bool = False                  # data source = mock gateway for these runs
