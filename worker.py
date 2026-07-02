@@ -19,8 +19,21 @@ from activities.pipeline import (
     shape_offer_llm,
     write_audit,
 )
+from activities.deadstock import (
+    discover_dead_stock,
+    persist_deadstock_candidate,
+    persist_deadstock_state,
+    plan_deadstock_run,
+    read_deadstock_stock,
+    resolve_sku_meta,
+)
+from activities.profile import resolve_intraday_profile
+from activities.snapshot import poll_facility_snapshot, read_snapshot
 from db.database import init_db
 from shared.config import TASK_QUEUE, get_client
+from workflows.deadstock import DeadStockClearanceWorkflow
+from workflows.deadstock_parent import DeadStockDiscoveryWorkflow
+from workflows.facility_poller import FacilitySellThroughPoller
 from workflows.markdown import PerishableMarkdownWorkflow
 
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +46,12 @@ async def main() -> None:
         worker = Worker(
             client,
             task_queue=TASK_QUEUE,
-            workflows=[PerishableMarkdownWorkflow],
+            workflows=[
+                PerishableMarkdownWorkflow,
+                FacilitySellThroughPoller,
+                DeadStockClearanceWorkflow,
+                DeadStockDiscoveryWorkflow,
+            ],
             activities=[
                 plan_run,
                 fetch_sellthrough,
@@ -48,6 +66,15 @@ async def main() -> None:
                 persist_decision,
                 capture_offer_baseline,
                 measure_offer_outcome,
+                resolve_intraday_profile,
+                poll_facility_snapshot,
+                read_snapshot,
+                discover_dead_stock,
+                plan_deadstock_run,
+                read_deadstock_stock,
+                resolve_sku_meta,
+                persist_deadstock_state,
+                persist_deadstock_candidate,
             ],
             activity_executor=executor,
         )

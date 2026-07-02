@@ -26,6 +26,7 @@ export default function App() {
           <NavLink to="/approvals">
             Approvals{awaiting > 0 && <span className="badge">{awaiting}</span>}
           </NavLink>
+          <NavLink to="/deadstock">Dead Stock</NavLink>
           <NavLink to="/config">Config</NavLink>
           <NavLink to="/offers">My Offers</NavLink>
         </nav>

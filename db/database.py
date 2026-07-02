@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 
+import shared.env  # noqa: F401 — side effect: load .env before reading DATABASE_URL
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 

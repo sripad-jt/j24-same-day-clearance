@@ -20,7 +20,16 @@ DEFAULT_RUNGS: list[RungDef] = [
 
 
 def default_config(**overrides) -> MarkdownConfig:
-    cfg = MarkdownConfig(rungs=DEFAULT_RUNGS)
+    """Build the run config. v3 flags default from env (read here, on the activity
+    side, so the workflow only ever sees a snapshotted value — replay-safe)."""
+    import os
+
+    env_defaults = {
+        "projection_mode": os.getenv("PROJECTION_MODE", "v3").lower(),
+        "read_from_snapshot": os.getenv("READ_FROM_SNAPSHOT", "false").lower()
+        in ("1", "true", "yes"),
+    }
+    cfg = MarkdownConfig(rungs=DEFAULT_RUNGS, **env_defaults)
     if overrides:
         cfg = cfg.model_copy(update=overrides)
     return cfg

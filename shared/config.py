@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import os
 
+import shared.env  # noqa: F401 — side effect: load .env before reading TEMPORAL_*
+
 from temporalio.client import Client
 from temporalio.contrib.pydantic import pydantic_data_converter
 

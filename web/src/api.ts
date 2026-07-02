@@ -1,5 +1,8 @@
 import type {
   Candidate,
+  DeadStockCandidate,
+  DeadStockRunDetail,
+  DeadStockRunSummary,
   InventorySnapshot,
   OfferOutcome,
   RunDetail,
@@ -43,6 +46,7 @@ export const api = {
     jpins?: string[];
     count?: number;
     include_rte?: boolean;
+    simulate?: boolean;
   }) => post<{ started: string[] }>("/runs/seed", body),
   decide: (id: string, approve: boolean, rung: string) =>
     post(`/runs/${encodeURIComponent(id)}/decision`, { rung, approve }),
@@ -51,6 +55,10 @@ export const api = {
   grn: (id: string, qty: number) =>
     post(`/runs/${encodeURIComponent(id)}/grn`, { qty }),
   soldOut: (id: string) => post(`/runs/${encodeURIComponent(id)}/soldout`),
+  simulate: (
+    id: string,
+    body: { units_sold?: number; recent_rate?: number; q0?: number }
+  ) => post(`/runs/${encodeURIComponent(id)}/simulate`, body),
   setStandingRule: (id: string, pct: number) =>
     post(`/runs/${encodeURIComponent(id)}/standing-rule`, {
       auto_approve_max_discount_pct: pct,
@@ -59,6 +67,29 @@ export const api = {
     fetch(`${API}/stores/${encodeURIComponent(storeId)}/offers`).then((r) =>
       j<OfferOutcome[]>(r)
     ),
+
+  // --- dead stock (multi-day clearance) ---
+  listDeadStock: (storeId: string) =>
+    fetch(`${API}/deadstock?store_id=${encodeURIComponent(storeId)}`).then((r) =>
+      j<{ candidates: DeadStockCandidate[]; runs: DeadStockRunSummary[] }>(r)
+    ),
+  getDeadStockRun: (id: string) =>
+    fetch(`${API}/deadstock/runs/${encodeURIComponent(id)}`).then((r) =>
+      j<DeadStockRunDetail>(r)
+    ),
+  deadStockDiscover: (body: {
+    store_id: string;
+    auto_start: boolean;
+    demo_speed: number;
+    shadow_mode: boolean;
+  }) => post<{ started: string }>("/deadstock/discover", body),
+  deadStockSeed: (body: {
+    store_id: string;
+    jpins: string[];
+    demo_speed: number;
+    shadow_mode: boolean;
+    simulate: boolean;
+  }) => post<{ started: string[] }>("/deadstock/seed", body),
 };
 
 export function poll<T>(fn: () => Promise<T>, ms: number, cb: (v: T) => void) {

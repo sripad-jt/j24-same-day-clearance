@@ -19,11 +19,18 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import os
 import time
 
 from adapters import _bolt
 
 log = logging.getLogger("inventory")
+
+# Per-JPIN OUTWARDED scan timeout for the snapshot path. The endpoint is slow and
+# un-indexed server-side for high-volume sellers (P0 #2), so this is a partial
+# mitigation only — bump it to give big movers a chance, but the real fix is a
+# time-indexed OUTWARDED query / POS feed from SCM. Env-tunable.
+_SELLTHROUGH_TIMEOUT_S = float(os.getenv("BOLT_SELLTHROUGH_TIMEOUT_S", "180"))
 
 
 # --------------------------------------------------------------------------- #
@@ -168,8 +175,51 @@ async def live_active_batch(
     }
 
 
+async def live_stock_detail(
+    jpin: str, facility_id: str, timeout: float = 100.0
+) -> dict:
+    """Active-state stock detail for one JPIN (for dead-stock clearance).
+
+    Single fast active-state details call. Returns:
+      {"on_hand": int|None, "oldest_created_ms": int|None, "list_price": float|None}
+    - on_hand           = sum of leftQty across active rows
+    - oldest_created_ms = min inventoryItemCreatedTime among rows with stock
+                          (the lot's received time → days-since-received)
+    - list_price        = listingSellingPrice (uniform across active rows)
+    None fields on timeout/error or when the JPIN has no active stock.
+    """
+    try:
+        rows = await _bolt.details(
+            [jpin], facility_id, _bolt.ACTIVE_STATES, _bolt.ACTIVE_STATUSES,
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001 - best-effort live read
+        log.warning("live_stock_detail(%s) failed: %s", jpin, e)
+        return {"on_hand": None, "oldest_created_ms": None, "list_price": None}
+
+    on_hand = 0
+    oldest_ms: int | None = None
+    price: float | None = None
+    for r in rows:
+        item = r.get("inventoryItem") or {}
+        if (item.get("jpin") or "") != jpin:
+            continue
+        left = int(item.get("leftQty") or 0)
+        on_hand += left
+        created = int(r.get("inventoryItemCreatedTime") or 0)
+        if left > 0 and created > 0:
+            oldest_ms = created if oldest_ms is None else min(oldest_ms, created)
+        if price is None and r.get("listingSellingPrice"):
+            price = float(r["listingSellingPrice"])
+    return {
+        "on_hand": on_hand or None,
+        "oldest_created_ms": oldest_ms,
+        "list_price": price,
+    }
+
+
 async def live_sold_snapshot(
-    jpins: list[str], facility_id: str, t0_ms: int, timeout: float = 22.0
+    jpins: list[str], facility_id: str, t0_ms: int, timeout: float | None = None
 ) -> dict[str, dict]:
     """Full day-start snapshot per JPIN — two parallel Bolt calls.
 
@@ -179,6 +229,8 @@ async def live_sold_snapshot(
     - received_today  = GRN lots inwarded since T0
     - sold_today      = OUTWARDED units since T0
     """
+    if timeout is None:
+        timeout = _SELLTHROUGH_TIMEOUT_S
     active_task = live_active_batch(jpins, facility_id, t0_ms, timeout=timeout)
     sold_results = asyncio.gather(
         *(live_units_sold(j, facility_id, t0_ms, timeout) for j in jpins),

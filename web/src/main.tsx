@@ -7,6 +7,8 @@ import RunDetail from "./pages/RunDetail";
 import Approval from "./pages/Approval";
 import Config from "./pages/Config";
 import MyOffers from "./pages/MyOffers";
+import DeadStock from "./pages/DeadStock";
+import DeadStockRun from "./pages/DeadStockRun";
 import "./styles.css";
 
 const router = createBrowserRouter(
@@ -20,6 +22,8 @@ const router = createBrowserRouter(
         { path: "config", element: <Config /> },
         { path: "runs/:id", element: <RunDetail /> },
         { path: "offers", element: <MyOffers /> },
+        { path: "deadstock", element: <DeadStock /> },
+        { path: "deadstock/runs/:id", element: <DeadStockRun /> },
       ],
     },
   ],

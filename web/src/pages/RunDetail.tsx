@@ -17,6 +17,10 @@ export default function RunDetail() {
   const [run, setRun] = useState<Detail | null>(null);
   const [standingPct, setStandingPct] = useState("");
   const [standingMsg, setStandingMsg] = useState("");
+  const [simUnits, setSimUnits] = useState("");
+  const [simRate, setSimRate] = useState("");
+  const [simQ0, setSimQ0] = useState("");
+  const [simMsg, setSimMsg] = useState("");
 
   useEffect(() => poll(() => api.getRun(id), 1500, setRun), [id]);
 
@@ -39,6 +43,21 @@ export default function RunDetail() {
     api.setStandingRule(id, pct).then(() => {
       setStandingMsg(`Auto-approve ceiling set to ${pct}% off.`);
       setStandingPct("");
+    });
+  };
+
+  const applySim = () => {
+    const body: { units_sold?: number; recent_rate?: number; q0?: number } = {};
+    if (simUnits !== "") body.units_sold = parseInt(simUnits, 10);
+    if (simRate !== "") body.recent_rate = parseFloat(simRate);
+    if (simQ0 !== "") body.q0 = parseInt(simQ0, 10);
+    if (Object.keys(body).length === 0) {
+      setSimMsg("Enter at least one value to simulate.");
+      return;
+    }
+    api.simulate(id, body).then(() => {
+      setSimMsg("Applied — the agent will re-decide on the next tick.");
+      api.getRun(id).then(setRun);
     });
   };
 
@@ -118,6 +137,51 @@ export default function RunDetail() {
             <button className="bad" onClick={() => decide(false)}>
               Reject
             </button>
+          </div>
+        </div>
+      )}
+
+      {live?.simulate && (
+        <div className="card">
+          <h3>
+            Simulation <span className="tag">sim mode</span>
+          </h3>
+          <p className="muted">
+            Live price anchor; you drive sell-through. Set absolute values —
+            blank fields keep the current value. Currently sold{" "}
+            <b>{run.units_sold}</b> / Q0 <b>{run.q0}</b> at {rate.toFixed(1)}/h.
+          </p>
+          <div className="row" style={{ alignItems: "center", flexWrap: "wrap" }}>
+            <label style={{ marginRight: 6 }}>Units sold</label>
+            <input
+              type="number"
+              min={0}
+              placeholder={String(run.units_sold)}
+              value={simUnits}
+              onChange={(e) => setSimUnits(e.target.value)}
+              style={{ width: 90, marginRight: 12 }}
+            />
+            <label style={{ marginRight: 6 }}>Rate /h</label>
+            <input
+              type="number"
+              min={0}
+              step={0.5}
+              placeholder="auto"
+              value={simRate}
+              onChange={(e) => setSimRate(e.target.value)}
+              style={{ width: 80, marginRight: 12 }}
+            />
+            <label style={{ marginRight: 6 }}>Q0</label>
+            <input
+              type="number"
+              min={0}
+              placeholder={String(run.q0)}
+              value={simQ0}
+              onChange={(e) => setSimQ0(e.target.value)}
+              style={{ width: 80, marginRight: 12 }}
+            />
+            <button onClick={applySim}>Apply</button>
+            {simMsg && <span className="muted" style={{ marginLeft: 8 }}>{simMsg}</span>}
           </div>
         </div>
       )}

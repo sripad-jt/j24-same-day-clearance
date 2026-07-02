@@ -87,6 +87,11 @@ class MarkdownConfig(BaseModel):
     # continuous loop
     poll_interval_min: float = 30.0    # how often to evaluate per nominal hour
     measure_window_h: float = 1.5      # how long after offer to measure lift
+    # v3 — projection + read path (snapshotted at run start; env-driven defaults)
+    projection_mode: str = "v3"        # "v3" (profile-aware) | "v2" (flat rate)
+    read_from_snapshot: bool = False   # read shared facility snapshot vs direct Bolt
+    profile_share_ref: float = 0.12    # cum_share at which pace is fully trusted
+    profile_units_ref: float = 5.0     # units observed at which pace is fully trusted
     # misc
     enable_llm: bool = False
     shadow_mode: bool = False
@@ -235,6 +240,7 @@ class MarkdownState(BaseModel):
     status: RunStatus = RunStatus.STARTED
     awaiting_approval: bool = False
     shadow_mode: bool = False
+    simulate: bool = False             # sim mode: sell-through driven from the UI, not Bolt
     pending_rung: Optional[str] = None
     pending_price: Optional[float] = None
     low_confidence: bool = False
@@ -344,3 +350,145 @@ class SeedRequest(BaseModel):
     demo_speed: float = 1800.0
     include_rte: bool = True
     jpins: Optional[list[str]] = None
+    simulate: bool = False             # start runs in UI-driven sim mode (live price, editable sell-through)
+
+
+class SimulateRequest(BaseModel):
+    """Signal payload — operator-driven sell-through for a run in sim mode.
+
+    Any field left None keeps the run's current value. `units_sold`/`q0` are
+    absolute (not increments); `recent_rate` is trailing units/hour and, if
+    omitted, is derived from `units_sold` over the elapsed nominal day.
+    """
+
+    units_sold: Optional[int] = None
+    recent_rate: Optional[float] = None
+    q0: Optional[int] = None
+
+
+# --------------------------------------------------------------------------- #
+# Intraday profile (v3) — hour-of-day demand shape, resolved in an activity and
+# passed PURE into the projector so decide_v3 stays replay-safe.
+# --------------------------------------------------------------------------- #
+class IntradayProfile(BaseModel):
+    """Cumulative/remaining demand share at a point in the day for one JPIN.
+
+    `share` values come from the hourly-profile artifact (pipelines/hourly):
+    per (STORE_ID, ITEM_NUMBER, dow) the 24-vector sums to 1.0. Here we collapse
+    it to the two numbers the projector needs at the current wall-clock moment.
+    """
+
+    store_id: str
+    jpin: str
+    dow: int                           # 0=Mon .. 6=Sun (of the clearance day)
+    hour: int                          # current IST hour used for the cut
+    cum_share_to_now: float            # demand fraction elapsed by `hour`+frac
+    remaining_share: float             # demand fraction still ahead to close
+    source_level: str = "none"         # sku | category | store | synthetic | none
+    low_confidence: bool = False
+    generated_at: str = ""
+
+
+class AddJpinsRequest(BaseModel):
+    """Signal payload — fold newly-received candidate JPINs into the facility poller."""
+
+    jpins: list[str]
+
+
+# --------------------------------------------------------------------------- #
+# Dead-stock multi-day clearance (separate workflow)
+# --------------------------------------------------------------------------- #
+class DeadStockItem(BaseModel):
+    """One dead-stock candidate from posgateway (adapters/deadstock.py)."""
+
+    jpin: str
+    days_unsold: int = 0
+    last_sold_ms: int = 0
+    rank: int = 1_000_000
+
+
+class DeadStockPlan(BaseModel):
+    """Output of plan_deadstock_run — the snapshotted facts + config for a run.
+
+    Shelf life comes from the SKU-master parquet; on-hand/received/list price from
+    Bolt. `days_since_received` feeds the half-shelf-life remaining-runway estimate.
+    """
+
+    store_id: str
+    jpin: str
+    product_title: str = ""
+    category: str = ""
+    is_rte: bool = False
+    shelf_life_days: int = 0
+    days_since_received: int = 0
+    days_unsold: int = 0
+    on_hand: int = 0
+    list_price: float = 0.0
+    floor_price: float = 0.0
+    mrp: float = 0.0
+    config: MarkdownConfig
+    eligible: bool = True
+    skip_reason: Optional[str] = None
+
+
+class DeadStockDecision(BaseModel):
+    """Pure output of the daily dead-stock decision (pricing/deadstock_engine.py)."""
+
+    mode: str                           # ClearanceMode value
+    target_price: float
+    discount_pct: float
+    days_to_expiry: int
+    remaining_shelf_life_days: int
+    projected_days_to_clear: float
+    reorder_action: str = "NONE"
+    clears: bool = True
+    requires_approval: bool = True
+    reason: str = ""
+
+
+class DeadStockState(BaseModel):
+    """Query/read-model state for a dead-stock clearance run."""
+
+    store_id: str
+    jpin: str
+    product_title: str = ""
+    category: str = ""
+    is_rte: bool = False
+    status: RunStatus = RunStatus.STARTED
+    shelf_life_days: int = 0
+    days_since_received: int = 0
+    days_to_expiry: int = 0
+    remaining_shelf_life_days: int = 0
+    days_unsold: int = 0
+    on_hand: int = 0
+    list_price: float = 0.0
+    current_price: float = 0.0
+    floor_price: float = 0.0
+    current_discount_pct: float = 0.0
+    mode: str = "HOLD"
+    reorder_action: str = "NONE"
+    projected_days_to_clear: float = 0.0
+    standing_rule_pct: float = 100.0
+    awaiting_approval: bool = False
+    pending_price: Optional[float] = None
+    simulate: bool = False
+    last_reason: str = ""
+
+
+class DeadStockDiscoverRequest(BaseModel):
+    """API — start/kick the per-store dead-stock discovery workflow."""
+
+    store_id: str = "BZID-1304298141"
+    auto_start: bool = False            # start clearance runs automatically vs discover-only
+    demo_speed: float = 1800.0
+    shadow_mode: bool = False
+
+
+class DeadStockSeedRequest(BaseModel):
+    """API — manually start clearance runs for chosen dead-stock JPINs."""
+
+    store_id: str = "BZID-1304298141"
+    jpins: list[str]
+    demo_speed: float = 1800.0
+    shadow_mode: bool = False
+    simulate: bool = False

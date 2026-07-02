@@ -175,3 +175,93 @@ class OfferOutcomeRow(Base):
     waste_avoided_value: Mapped[float] = mapped_column(Float, default=0.0)
     headline: Mapped[str] = mapped_column(Text, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+
+class SellThroughSnapshotRow(Base):
+    """Shared per-facility sell-through read-model (v3 poller writes; batch
+    workflows read). Decouples the ONE slow OUTWARDED scan per JPIN from the N
+    batch workflows that need it, and gives a fast, cache-friendly source. Keyed
+    on (facility_id, jpin, receipt_date) — last write wins.
+    """
+
+    __tablename__ = "sell_through_snapshots"
+    __table_args__ = (
+        UniqueConstraint("facility_id", "jpin", "receipt_date",
+                         name="uq_snapshot_fac_jpin_date"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    facility_id: Mapped[str] = mapped_column(String(64), index=True)
+    store_id: Mapped[str] = mapped_column(String(64), index=True)
+    jpin: Mapped[str] = mapped_column(String(64), index=True)
+    receipt_date: Mapped[str] = mapped_column(String(16), index=True)
+    q0: Mapped[int] = mapped_column(Integer, default=0)
+    q0_source: Mapped[str] = mapped_column(String(32), default="none")
+    units_sold_today: Mapped[int] = mapped_column(Integer, default=0)
+    recent_rate: Mapped[float] = mapped_column(Float, default=0.0)
+    window_h: Mapped[float] = mapped_column(Float, default=0.0)
+    low_confidence: Mapped[bool] = mapped_column(Boolean, default=False)
+    fetched_at_ms: Mapped[int] = mapped_column(Integer, default=0)   # epoch-ms of the read
+    stale: Mapped[bool] = mapped_column(Boolean, default=False)      # last poll failed
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class DeadStockCandidateRow(Base):
+    """Discovered dead-stock candidates per store (from posgateway). One row per
+    (store_id, jpin) — last write wins; `run_id` links to an active clearance run."""
+
+    __tablename__ = "dead_stock_candidates"
+    __table_args__ = (
+        UniqueConstraint("store_id", "jpin", name="uq_deadstock_store_jpin"),
+    )
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    store_id: Mapped[str] = mapped_column(String(64), index=True)
+    jpin: Mapped[str] = mapped_column(String(64), index=True)
+    product_title: Mapped[str] = mapped_column(String(256), default="")
+    days_unsold: Mapped[int] = mapped_column(Integer, default=0)
+    shelf_life_days: Mapped[int] = mapped_column(Integer, default=0)
+    remaining_shelf_life_days: Mapped[int] = mapped_column(Integer, default=0)
+    on_hand: Mapped[int] = mapped_column(Integer, default=0)
+    rank: Mapped[int] = mapped_column(Integer, default=1_000_000)
+    status: Mapped[str] = mapped_column(String(24), default="FLAGGED", index=True)
+    run_id: Mapped[str] = mapped_column(String(200), default="")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+
+class DeadStockRun(Base):
+    """Read-model for a multi-day dead-stock clearance run (mirrors MarkdownRun
+    but with shelf-life fields). Ledgers (decisions/price_changes/events/audit) are
+    the generic tables keyed by run_id."""
+
+    __tablename__ = "dead_stock_runs"
+    run_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    store_id: Mapped[str] = mapped_column(String(64), index=True)
+    jpin: Mapped[str] = mapped_column(String(64), index=True)
+    product_title: Mapped[str] = mapped_column(String(256), default="")
+    category: Mapped[str] = mapped_column(String(64), default="")
+    is_rte: Mapped[bool] = mapped_column(Boolean, default=False)
+    status: Mapped[str] = mapped_column(String(32), index=True, default="STARTED")
+    shelf_life_days: Mapped[int] = mapped_column(Integer, default=0)
+    days_since_received: Mapped[int] = mapped_column(Integer, default=0)
+    days_to_expiry: Mapped[int] = mapped_column(Integer, default=0)
+    remaining_shelf_life_days: Mapped[int] = mapped_column(Integer, default=0)
+    days_unsold: Mapped[int] = mapped_column(Integer, default=0)
+    on_hand: Mapped[int] = mapped_column(Integer, default=0)
+    list_price: Mapped[float] = mapped_column(Float, default=0.0)
+    current_price: Mapped[float] = mapped_column(Float, default=0.0)
+    floor_price: Mapped[float] = mapped_column(Float, default=0.0)
+    current_discount_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    mode: Mapped[str] = mapped_column(String(32), default="HOLD")
+    reorder_action: Mapped[str] = mapped_column(String(32), default="NONE")
+    awaiting_approval: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    standing_rule_pct: Mapped[float] = mapped_column(Float, default=100.0)
+    simulate: Mapped[bool] = mapped_column(Boolean, default=False)
+    shadow_mode: Mapped[bool] = mapped_column(Boolean, default=False)
+    summary: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )

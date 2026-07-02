@@ -111,6 +111,7 @@ export interface LiveState {
   low_confidence: boolean;
   status: string;
   awaiting_approval: boolean;
+  simulate: boolean;
   pending_rung: string | null;
   pending_price: number | null;
   last_reason: string;
@@ -140,4 +141,59 @@ export interface RunDetail extends RunSummary {
   price_changes: PriceChange[];
   offers: Offer[];
   live?: LiveState | null;
+}
+
+export interface DeadStockCandidate {
+  store_id: string;
+  jpin: string;
+  product_title: string;
+  days_unsold: number;
+  shelf_life_days: number;
+  remaining_shelf_life_days: number;
+  on_hand: number;
+  rank: number;
+  status: string;
+  run_id: string;
+  updated_at: string | null;
+}
+
+export interface DeadStockRunSummary {
+  run_id: string;
+  store_id: string;
+  jpin: string;
+  product_title: string;
+  category: string;
+  is_rte: boolean;
+  status: string;
+  shelf_life_days: number;
+  days_since_received: number;
+  days_to_expiry: number;
+  remaining_shelf_life_days: number;
+  days_unsold: number;
+  on_hand: number;
+  list_price: number;
+  current_price: number;
+  floor_price: number;
+  current_discount_pct: number;
+  mode: string;
+  reorder_action: string;
+  awaiting_approval: boolean;
+  standing_rule_pct: number;
+  simulate: boolean;
+  shadow_mode: boolean;
+  summary: string;
+  updated_at: string | null;
+}
+
+export interface DeadStockLiveState extends DeadStockRunSummary {
+  last_reason: string;
+  pending_price: number | null;
+  projected_days_to_clear: number;
+}
+
+export interface DeadStockRunDetail extends DeadStockRunSummary {
+  events: RunEvent[];
+  decisions: DecisionRow[];
+  price_changes: PriceChange[];
+  live?: DeadStockLiveState | null;
 }

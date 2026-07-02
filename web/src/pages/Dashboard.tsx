@@ -18,6 +18,7 @@ export default function Dashboard() {
   const [invLoading, setInvLoading] = useState(false);
   const [speed, setSpeed] = useState(1800);
   const [shadow, setShadow] = useState(false);
+  const [sim, setSim] = useState(false);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => poll(api.listRuns, 2000, setRuns), []);
@@ -83,6 +84,7 @@ export default function Dashboard() {
         jpins: [...selected],
         shadow_mode: shadow,
         demo_speed: speed,
+        simulate: sim,
       });
       setRuns(await api.listRuns());
     } finally {
@@ -132,6 +134,14 @@ export default function Dashboard() {
               onChange={(e) => setShadow(e.target.checked)}
             />
             Shadow mode (no price writes)
+          </label>
+          <label className="checkbox">
+            <input
+              type="checkbox"
+              checked={sim}
+              onChange={(e) => setSim(e.target.checked)}
+            />
+            Simulate (live price, edit sell-through in the run)
           </label>
         </div>
 

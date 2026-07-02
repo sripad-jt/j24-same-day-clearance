@@ -7,6 +7,7 @@ GRN, sold-out). The workflow remains the source of truth.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from datetime import date
 
@@ -22,11 +23,16 @@ from db import repo
 from db.database import init_db
 from pricing.ladder import default_config
 from shared.config import TASK_QUEUE, get_client
+from workflows.deadstock import DeadStockClearanceWorkflow
+from workflows.deadstock_parent import DeadStockDiscoveryWorkflow
 from shared.models import (
     AdditionalGrn,
+    DeadStockDiscoverRequest,
+    DeadStockSeedRequest,
     ManualOverride,
     OwnerDecision,
     SeedRequest,
+    SimulateRequest,
     StandingRuleRequest,
 )
 from shared.stores import DEFAULT_STORE_ID, STORE_DIRECTORY, get_store
@@ -121,11 +127,12 @@ async def get_audit(run_id: str) -> list[dict]:
 
 
 # In-memory inventory cache: store_id → snapshot dict.
-# The Bolt fetch runs in a background task (up to 120s) so the HTTP response
-# returns immediately — avoiding the upstream nginx proxy timeout.
+# The Bolt fetch runs in a background task so the HTTP response returns
+# immediately — avoiding the upstream nginx proxy timeout. The scan itself can
+# take minutes for high-volume sellers; the timeout is env-tunable (default 3 min).
 _inv_cache: dict[str, dict] = {}
 _inv_fetching: set[str] = set()
-_BOLT_FETCH_TIMEOUT = 120.0   # seconds — Bolt can take ~80s per batch
+_BOLT_FETCH_TIMEOUT = float(os.getenv("BOLT_SELLTHROUGH_TIMEOUT_S", "180"))
 _CACHE_TTL = 300.0            # seconds — treat cache as fresh for 5 min
 
 
@@ -247,7 +254,8 @@ async def seed(req: SeedRequest) -> dict:
         wid = f"perish-markdown-{req.store_id}-{jpin}-{today}"
         await c.start_workflow(
             PerishableMarkdownWorkflow.run,
-            args=[req.store_id, jpin, today, req.shadow_mode, req.demo_speed],
+            args=[req.store_id, jpin, today, req.shadow_mode, req.demo_speed,
+                  req.simulate],
             id=wid,
             task_queue=TASK_QUEUE,
             id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
@@ -278,6 +286,74 @@ async def grn(run_id: str, body: AdditionalGrn) -> dict:
 async def soldout(run_id: str) -> dict:
     await _signal(run_id, "sold_out")
     return {"ok": True}
+
+
+@app.post("/api/runs/{run_id}/simulate")
+async def simulate(run_id: str, body: SimulateRequest) -> dict:
+    await _signal(run_id, "simulate", body)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------- #
+# Dead-stock multi-day clearance (separate workflow + UI page). Steering reuses
+# the generic signal endpoints above (/decision, /override, /soldout, /simulate,
+# /standing-rule) since the dead-stock workflow shares those signal names.
+# --------------------------------------------------------------------------- #
+@app.get("/api/deadstock")
+async def list_deadstock(store_id: str = DEFAULT_STORE_ID) -> dict:
+    return {
+        "candidates": repo.list_dead_stock_candidates(store_id),
+        "runs": repo.list_dead_stock_runs(store_id),
+    }
+
+
+@app.get("/api/deadstock/runs/{run_id}")
+async def get_deadstock_run(run_id: str) -> dict:
+    row = repo.get_dead_stock_run(run_id)
+    if row is None:
+        raise HTTPException(404, "dead-stock run not found")
+    try:
+        handle = (await client()).get_workflow_handle(run_id)
+        live = await handle.query(DeadStockClearanceWorkflow.current_state)
+        if live is not None:
+            row["live"] = live.model_dump()
+    except (RPCError, Exception):
+        row["live"] = None
+    return row
+
+
+@app.post("/api/deadstock/discover")
+async def deadstock_discover(req: DeadStockDiscoverRequest) -> dict:
+    c = await client()
+    store = get_store(req.store_id)
+    repo.upsert_store(req.store_id, store["name"] if store else req.store_id, 21)
+    wid = f"deadstock-discovery-{req.store_id}"
+    await c.start_workflow(
+        DeadStockDiscoveryWorkflow.run,
+        args=[req.store_id, req.auto_start, req.shadow_mode, req.demo_speed],
+        id=wid, task_queue=TASK_QUEUE,
+        id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+    )
+    return {"started": wid}
+
+
+@app.post("/api/deadstock/seed")
+async def deadstock_seed(req: DeadStockSeedRequest) -> dict:
+    """Manually start clearance runs for chosen dead-stock JPINs — human-gated
+    (auto_apply off, standing rule 0 → every markdown asks for approval)."""
+    c = await client()
+    started = []
+    for jpin in req.jpins:
+        wid = f"deadstock-{req.store_id}-{jpin}"
+        await c.start_workflow(
+            DeadStockClearanceWorkflow.run,
+            args=[req.store_id, jpin, 0, req.shadow_mode, req.demo_speed,
+                  req.simulate, False, 0.0],
+            id=wid, task_queue=TASK_QUEUE,
+            id_reuse_policy=WorkflowIDReusePolicy.ALLOW_DUPLICATE,
+        )
+        started.append(wid)
+    return {"started": started}
 
 
 @app.post("/api/runs/{run_id}/standing-rule")

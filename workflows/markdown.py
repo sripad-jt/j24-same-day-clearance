@@ -33,7 +33,10 @@ with workflow.unsafe.imports_passed_through():
         shape_offer_llm,
         write_audit,
     )
-    from pricing.decision_engine import decide_v2, price_for_rung
+    from activities.profile import resolve_intraday_profile
+    from activities.snapshot import read_snapshot
+    from pricing.decision_engine import decide_v2, decide_v3, price_for_rung
+    from pricing.projection import project_remaining_demand
     from pricing.shelf_life_scheduler import plan_clearance
     from shared.models import (
         AdditionalGrn,
@@ -47,6 +50,8 @@ with workflow.unsafe.imports_passed_through():
         OwnerDecision,
         PriceDecisionV2,
         RunStatus,
+        SellThroughV2,
+        SimulateRequest,
         StandingRuleRequest,
     )
     from shared.stores import get_store
@@ -102,6 +107,12 @@ def _days_to_expiry(expiry_date: str | None, receipt_date: str) -> int:
     return max(0, (target - today).days)
 
 
+def _dow(receipt_date: str) -> int:
+    """Day-of-week (0=Mon..6=Sun) of the clearance day — pure/deterministic."""
+    from datetime import date
+    return date.fromisoformat(receipt_date).weekday()
+
+
 @workflow.defn
 class PerishableMarkdownWorkflow:
     def __init__(self) -> None:
@@ -111,6 +122,8 @@ class PerishableMarkdownWorkflow:
         self._sold_out: bool = False
         self._stop: bool = False
         self._force_rung_label: str | None = None
+        self._sim: SimulateRequest | None = None   # set in sim mode; UI-driven sell-through
+        self._sim_dirty: bool = False              # a sim edit arrived → re-decide now
 
     # ----------------------------------------------------------------- run --- #
     @workflow.run
@@ -121,6 +134,7 @@ class PerishableMarkdownWorkflow:
         receipt_date: str,
         shadow_mode: bool = False,
         demo_speed: float = 1800.0,
+        simulate: bool = False,
     ) -> str:
         plan = await workflow.execute_activity(
             plan_run,
@@ -160,7 +174,12 @@ class PerishableMarkdownWorkflow:
             clearance_mode=shelf_plan.mode.value,
             reorder_action=shelf_plan.reorder_action.value,
             status=RunStatus.OBSERVING, shadow_mode=shadow_mode,
+            simulate=simulate,
         )
+        # Sim mode: seed sell-through from the live Q0 (price is already live from
+        # plan_run); the operator then drives units_sold/rate/Q0 from the UI.
+        if simulate:
+            self._sim = SimulateRequest(units_sold=0, recent_rate=0.0, q0=r.q0)
         await self._sync(run_id)
         await self._event(
             run_id, "STARTED",
@@ -207,7 +226,7 @@ class PerishableMarkdownWorkflow:
             try:
                 await workflow.wait_condition(
                     lambda: bool(self._pending_grn or self._force_rung_label
-                                 or self._stop or self._sold_out),
+                                 or self._stop or self._sold_out or self._sim_dirty),
                     timeout=timedelta(seconds=poll_s),
                 )
             except asyncio.TimeoutError:
@@ -227,15 +246,43 @@ class PerishableMarkdownWorkflow:
                 round((1 - self._state.current_price / self._state.list_price) * 100, 1)
                 if self._state.list_price else 0.0
             )
-            st = await workflow.execute_activity(
-                fetch_sellthrough,
-                args=[store_id, jpin, self._state.q0, t0_ms,
-                      cfg.trailing_window_hours, current_pct],
-                **_READ,
-            )
+            if self._state.simulate:
+                # Sim mode: sell-through comes from the operator (UI signal), not
+                # Bolt — this avoids the slow OUTWARDED read while keeping the live
+                # price anchor. rate defaults to the average over the nominal day.
+                self._sim_dirty = False
+                sim = self._sim or SimulateRequest()
+                sim_units = int(sim.units_sold or 0)
+                sim_q0 = int(sim.q0) if sim.q0 is not None else self._state.q0
+                sim_rate = (
+                    float(sim.recent_rate) if sim.recent_rate is not None
+                    else sim_units / max(nominal_elapsed_h, 0.5)
+                )
+                st = SellThroughV2(
+                    units_sold_today=sim_units,
+                    recent_rate=round(sim_rate, 3),
+                    q0=sim_q0,
+                    q0_source="sim",
+                    window_h=max(0.5, nominal_elapsed_h),
+                    low_confidence=False,
+                )
+            elif cfg.read_from_snapshot:
+                st = await workflow.execute_activity(
+                    read_snapshot,
+                    args=[store_id, jpin, receipt_date, self._state.q0],
+                    **_READ,
+                )
+            else:
+                st = await workflow.execute_activity(
+                    fetch_sellthrough,
+                    args=[store_id, jpin, self._state.q0, t0_ms,
+                          cfg.trailing_window_hours, current_pct],
+                    **_READ,
+                )
             self._state.units_sold = st.units_sold_today
             self._state.recent_rate = st.recent_rate
-            self._state.q0 = max(self._state.q0, st.q0)   # only move Q0 up (GRN-safe)
+            # Live/snapshot Q0 only moves up (GRN-safe); sim Q0 is set exactly.
+            self._state.q0 = st.q0 if self._state.simulate else max(self._state.q0, st.q0)
             self._state.q0_source = st.q0_source
             self._state.low_confidence = st.low_confidence
 
@@ -263,24 +310,62 @@ class PerishableMarkdownWorkflow:
                     clears=True, floored=False, requires_approval=False,
                 )
             else:
-                decision = decide_v2(
-                    q0=self._state.q0,
-                    units_sold=st.units_sold_today,
-                    recent_rate=st.recent_rate,
-                    remaining_h=remaining_h,
-                    current_price=self._state.current_price,
-                    list_price=r.list_price,
-                    floor_price=plan.floor_price,
-                    elasticity=cfg.elasticity,
-                    token_free_price=cfg.token_free_price,
-                    residual_tolerance=cfg.residual_tolerance,
-                    step_pct=cfg.step_pct,
-                    max_discount_pct=cfg.max_discount_pct,
-                    hysteresis_units=cfg.hysteresis_units,
-                    is_rte=r.is_rte,
-                    past_rte_gate=past_rte_gate,
-                    token_eligible=token_eligible,
-                )
+                if cfg.projection_mode == "v3":
+                    nominal_hour_ist = _T0_HOUR_IST + nominal_elapsed_h
+                    prof = await workflow.execute_activity(
+                        resolve_intraday_profile,
+                        args=[store_id, jpin, _dow(receipt_date),
+                              int(nominal_hour_ist), nominal_hour_ist % 1.0,
+                              _T0_HOUR_IST, cfg.store_close_hour],
+                        **_READ,
+                    )
+                    proj = project_remaining_demand(
+                        units_sold=st.units_sold_today,
+                        recent_rate=st.recent_rate,
+                        remaining_h=remaining_h,
+                        cum_share_to_now=prof.cum_share_to_now,
+                        remaining_share=prof.remaining_share,
+                        profile_source=prof.source_level,
+                        share_ref=cfg.profile_share_ref,
+                        units_ref=cfg.profile_units_ref,
+                    )
+                    decision = decide_v3(
+                        q0=self._state.q0,
+                        units_sold=st.units_sold_today,
+                        remaining_demand=proj.remaining_demand,
+                        current_price=self._state.current_price,
+                        list_price=r.list_price,
+                        floor_price=plan.floor_price,
+                        elasticity=cfg.elasticity,
+                        token_free_price=cfg.token_free_price,
+                        residual_tolerance=cfg.residual_tolerance,
+                        step_pct=cfg.step_pct,
+                        max_discount_pct=cfg.max_discount_pct,
+                        hysteresis_units=cfg.hysteresis_units,
+                        is_rte=r.is_rte,
+                        past_rte_gate=past_rte_gate,
+                        token_eligible=token_eligible,
+                        projection_method=proj.method,
+                    )
+                else:
+                    decision = decide_v2(
+                        q0=self._state.q0,
+                        units_sold=st.units_sold_today,
+                        recent_rate=st.recent_rate,
+                        remaining_h=remaining_h,
+                        current_price=self._state.current_price,
+                        list_price=r.list_price,
+                        floor_price=plan.floor_price,
+                        elasticity=cfg.elasticity,
+                        token_free_price=cfg.token_free_price,
+                        residual_tolerance=cfg.residual_tolerance,
+                        step_pct=cfg.step_pct,
+                        max_discount_pct=cfg.max_discount_pct,
+                        hysteresis_units=cfg.hysteresis_units,
+                        is_rte=r.is_rte,
+                        past_rte_gate=past_rte_gate,
+                        token_eligible=token_eligible,
+                    )
 
             self._state.projected_clearance = decision.projected_clearance_at_target
             self._state.residual = decision.residual_at_current
@@ -537,6 +622,18 @@ class PerishableMarkdownWorkflow:
     @workflow.signal
     def sold_out(self) -> None:
         self._sold_out = True
+
+    @workflow.signal
+    def simulate(self, req: SimulateRequest) -> None:
+        """Operator-driven sell-through for a sim-mode run. Absolute values;
+        None fields keep the current value. Wakes the loop to re-decide now."""
+        cur = self._sim or SimulateRequest()
+        self._sim = SimulateRequest(
+            units_sold=req.units_sold if req.units_sold is not None else cur.units_sold,
+            recent_rate=req.recent_rate if req.recent_rate is not None else cur.recent_rate,
+            q0=req.q0 if req.q0 is not None else cur.q0,
+        )
+        self._sim_dirty = True
 
     @workflow.signal
     def manual_override(self, ov: ManualOverride) -> None:

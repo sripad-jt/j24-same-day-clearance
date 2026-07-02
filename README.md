@@ -75,3 +75,65 @@ with API-key auth — no code change.
 ```bash
 PYTHONPATH=. pytest tests/      # decision-engine determinism guarantee
 ```
+
+---
+
+## v3 — profile-aware projection + shared read-model
+
+v3 fixes the two things that blocked trustworthy live pricing and adds a test
+harness, all additive and behind config flags:
+
+- **Projection** — replaces flat `rate × remaining_h` with a profile-aware pace
+  method (`pricing/projection.py` + `decide_v3`): observed sell-through sets the
+  *level*, the hourly demand `share` curve sets the *shape*, so the agent holds
+  through the 4 pm trough before the evening peak instead of over-marking-down.
+  The `share` curve comes from a **separate** hourly-forecast workflow (not in
+  this repo) that publishes to S3; we read it via `INTRADAY_PROFILE_S3_URI`
+  (`adapters/profile.py`, synthetic fallback if unset).
+- **Read-model** — `FacilitySellThroughPoller` (one per facility) batch-refreshes
+  a `sell_through_snapshot`; batches read it in ~1 ms instead of each scanning the
+  slow OUTWARDED endpoint (`READ_FROM_SNAPSHOT=true` + `python start_poller.py`).
+- **Testing** — `tools/mock_bolt.py` is a stateful, evening-peaked mock gateway so
+  the ladder actually walks with no real creds.
+
+Flags: `PROJECTION_MODE=v3|v2`, `READ_FROM_SNAPSHOT`, `INTRADAY_PROFILE_S3_URI`
+(or local `INTRADAY_PROFILE_PATH`; synthetic fallback if unset). Full
+walkthrough: **`docs/V3-TESTING.md`**.
+Design + diagram: **`docs/V3-Architecture-Design.md`** / `.docx`,
+`docs/architecture-v3.svg`.
+
+```bash
+PYTHONPATH=. pytest tests/            # 39 tests, incl. the evening-peak proof
+uvicorn tools.mock_bolt:app --port 9099   # then point the app at it (see V3-TESTING.md)
+```
+
+---
+
+## Dead-stock multi-day clearance (separate workflow + UI)
+
+Beyond same-day perishables, slow-moving / dead stock gets a **multi-day** markdown
+ramp keyed to remaining shelf life, in its own workflow and a **Dead Stock** UI page.
+
+- **Detect** — posgateway `POST /api/recommendation/dead-stock/{store}` (same source
+  as `j24-pulse`; `adapters/deadstock.py`). Set `POSGATEWAY_BASE_URL` + `POSGATEWAY_TOKEN`.
+- **Enrich** — on-hand / received-date / list price from Bolt; **`shelf_life_days` from a
+  SKU-master parquet** (`adapters/sku_master.py`, `SKU_MASTER_S3_URI`/`SKU_MASTER_PATH`).
+  When received/expiry is unknown, remaining runway is estimated from the
+  **received-at-half-shelf-life** assumption.
+- **Decide** — pure `pricing/deadstock_engine.py` → delegates to the existing
+  `plan_clearance` ramp (escalating discount as expiry nears; clears to floor at terminal).
+- **Run** — `DeadStockDiscoveryWorkflow` (per store, daily) discovers + optionally fans
+  out `DeadStockClearanceWorkflow` (per SKU, one markdown/day, owner-approved,
+  `continue_as_new`). Start with `python start_deadstock.py --store <id> [--auto-start]`.
+
+Reuses the same task queue, Golden Eye apply, approval, standing-rule, and sim mode.
+
+```bash
+PYTHONPATH=. pytest tests/                       # unit + adapters (E2E auto-skips)
+RUN_E2E=1 PYTHONPATH=. pytest tests/test_workflows_e2e.py   # time-skip workflow E2E
+```
+The E2E cases (`tests/e2e/`) run the real workflow → activity → SQLite path under a
+Temporal test server, faking only the single live-Bolt activity: `sim_clearance_e2e`
+proves the same-day v3 ladder walks; `deadstock_clearance_e2e` proves the multi-day
+ramp clears to floor. They're opt-in (`RUN_E2E=1`) since they download a test-server
+binary on first run.
